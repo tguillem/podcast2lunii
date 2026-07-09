@@ -1,0 +1,42 @@
+#!/bin/sh
+# yt-dlp-podcast — download a podcast RSS feed as an album, with track numbers
+# assigned by podcast-renumber (explicit title order when recognized, otherwise
+# reversed RSS item order).
+#
+# usage: yt-dlp-podcast RSS_URL [extra yt-dlp options]
+#
+# Safe to re-run: --download-archive (keyed on the feed's stable <guid>s)
+# skips episodes already fetched, then podcast-renumber drops French trailer
+# items by default and re-sorts the whole directory, so new episodes slot in at
+# the end of the numbering.
+set -e
+
+url=$1
+if [ -z "$url" ]; then
+    echo "usage: yt-dlp-podcast RSS_URL [yt-dlp options]" >&2
+    exit 1
+fi
+shift
+
+# Album directory, sanitized exactly as yt-dlp would write it (%(...)S)
+dir=$(yt-dlp --flat-playlist -I1 --print '%(playlist_title)S' "$url" | head -n1)
+if [ -z "$dir" ]; then
+    echo "yt-dlp-podcast: could not read playlist title from $url" >&2
+    exit 1
+fi
+
+# '%' in the title would otherwise be parsed as an output-template field
+esc=$(printf '%s' "$dir" | sed 's/%/%%/g')
+
+status=0
+yt-dlp -o "$esc/%(playlist_index)s_%(title)s.%(ext)s" \
+       --download-archive "$dir/.yt-dlp-archive" \
+       "$url" "$@" || status=$?
+if [ "$status" -ne 0 ]; then
+    echo "yt-dlp-podcast: warning: yt-dlp exited $status; renumbering what was downloaded" >&2
+fi
+
+renumber=$(dirname -- "$(readlink -f -- "$0")")/podcast-renumber
+[ -x "$renumber" ] || renumber=podcast-renumber
+"$renumber" --feed "$url" "$dir"
+exit "$status"

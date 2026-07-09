@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""Number a downloaded podcast directory by episode order (oldest = track 1).
+
+Episode order uses explicit 'N/M' numbering in item titles when every item
+carries one (e.g. "Tina ... 3/10 : ..."). Otherwise, the RSS item list
+is reversed (feeds list newest first -> oldest first).
+Each audio file is matched to a feed item by episode title, then gets:
+
+  * deletion of French trailer items by default unless --no-drop-trailers is
+    used
+  * tracknumber n/total (ID3 TRCK / MP4 trkn / vorbis TRACKNUMBER)
+  * album tag set to the feed channel title (or --album NAME)
+  * a date tag from the item's pubDate, only if the file has none
+  * a filename rename to '<NN>_<name-without-old-numeric-prefix>'
+
+MP3 tags are saved back as ID3v2.3 when that is what the file already used.
+
+usage: podcast-renumber --feed URL_or_FILE [options] DIR
+"""
+
+import argparse
+import re
+import sys
+import unicodedata
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+from urllib.request import Request, urlopen
+
+import mutagen
+from mutagen.id3 import ID3, ID3NoHeaderError, TALB, TDRC, TRCK
+from mutagen.mp4 import MP4
+
+AUDIO_EXTS = {".mp3", ".m4a", ".m4b", ".ogg", ".oga", ".opus", ".flac"}
+PREFIX_RE = re.compile(r"^\d+_")
+EPNUM_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
+
+
+def norm(s):
+    """Normalize a title for matching: fold the chars yt-dlp filename
+    sanitization substitutes (： ＂ ⧸ …), unify quotes, collapse spaces."""
+    s = unicodedata.normalize("NFKC", s)  # ：＂＊？＜＞ -> ascii
+    s = s.replace("⧸", "/").replace("⧹", "\\")
+    s = s.replace("’", "'").replace("‘", "'")
+    s = s.replace("“", '"').replace("”", '"')
+    return " ".join(s.casefold().split())
+
+
+def load_feed(src):
+    """Return (channel_title, items oldest-first: [{title, norm, pub, seq}])."""
+    if re.match(r"^https?://", src):
+        req = Request(src, headers={"User-Agent": "podcast-renumber/1.0"})
+        data = urlopen(req, timeout=30).read()
+    else:
+        data = Path(src).read_bytes()
+    channel = ET.fromstring(data).find("channel")
+    if channel is None:
+        sys.exit("error: not an RSS feed (no <channel>): %s" % src)
+    items = []
+    for it in channel.findall("item"):
+        title = (it.findtext("title") or "").strip()
+        if not title:
+            sys.exit("error: feed item without a title")
+        pubdate = it.findtext("pubDate")
+        items.append({
+            "title": title,
+            "norm": norm(title),
+            "pub": parsedate_to_datetime(pubdate) if pubdate else None,
+        })
+
+    # Episode order, highest priority first:
+    #   1. an 'N/M' series in the titles -> by N ascending (part 1 first),
+    #      with un-numbered extras (e.g. a "Bonus") kept after, oldest first.
+    #   2. else the RSS list reversed (newest-first feed -> oldest first).
+    ranks = None
+
+    marks = [EPNUM_RE.search(it["norm"]) for it in items]
+    if (ranks is None and items and all(marks)
+            and len({m.group(2) for m in marks}) == 1
+            and len({int(m.group(1)) for m in marks}) == len(marks)):
+        ranks = sorted(range(len(items)), key=lambda i: int(marks[i].group(1)))
+    if ranks is None:
+        ranks = range(len(items) - 1, -1, -1)
+    for seq, i in enumerate(ranks):
+        items[i]["seq"] = seq
+
+    return (channel.findtext("title") or "").strip(), items
+
+
+def title_candidates(path, tags):
+    cands = []
+    if tags:
+        t = (tags.get("title") or [""])[0]
+        if t:
+            cands.append(t)
+    cands.append(PREFIX_RE.sub("", path.stem))
+    return cands
+
+
+def compile_drop_patterns(args):
+    if args.no_drop_trailers:
+        return []
+    return [re.compile(r"^bande[- ]annonce\b", re.I)]
+
+
+def should_drop(patterns, *titles):
+    return any(p.search(norm(t)) for p in patterns for t in titles if t)
+
+
+def save_mp3(path, n, total, album, pub):
+    try:
+        raw_version = ID3(path, translate=False).version
+        tag = ID3(path)
+    except ID3NoHeaderError:
+        raw_version = (2, 3, 0)
+        tag = ID3()
+    tag.setall("TRCK", [TRCK(encoding=0, text=["%d/%d" % (n, total)])])
+    if album is not None:
+        enc = 0 if album.isascii() else 1  # latin-1 / UTF-16: both v2.3-safe
+        tag.setall("TALB", [TALB(encoding=enc, text=[album])])
+    if not tag.getall("TDRC") and pub is not None:
+        tag.setall("TDRC", [TDRC(encoding=0, text=[pub.date().isoformat()])])
+    if raw_version < (2, 4, 0):
+        tag.update_to_v23()
+        tag.save(path, v2_version=3)
+    else:
+        tag.save(path)
+
+
+def save_mp4(path, n, total, album, pub):
+    tag = MP4(path)
+    tag["trkn"] = [(n, total)]
+    if album is not None:
+        tag["\xa9alb"] = [album]
+    if "\xa9day" not in tag and pub is not None:
+        tag["\xa9day"] = [pub.date().isoformat()]
+    tag.save()
+
+
+def save_other(path, n, total, album, pub):
+    tag = mutagen.File(path, easy=True)
+    tag["tracknumber"] = ["%d/%d" % (n, total)]
+    if album is not None:
+        tag["album"] = [album]
+    if not tag.get("date") and pub is not None:
+        tag["date"] = [pub.date().isoformat()]
+    tag.save()
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("dir", type=Path)
+    ap.add_argument("--feed", required=True, metavar="URL_or_FILE",
+                    help="podcast RSS feed (source of episode order)")
+    ap.add_argument("--album", metavar="NAME",
+                    help="album tag to set (default: feed channel title)")
+    ap.add_argument("--keep-album", action="store_true",
+                    help="leave album tags untouched")
+    ap.add_argument("--allow-unmatched", action="store_true",
+                    help="files not found in the feed are numbered first "
+                         "(by existing track tag, then mtime) instead of aborting")
+    ap.add_argument("--drop-trailers", action="store_false",
+                    dest="no_drop_trailers",
+                    help="delete French trailer items whose title starts with "
+                         "'Bande-annonce' (default)")
+    ap.add_argument("--no-drop-trailers", action="store_true",
+                    help="keep French trailer items whose title starts with "
+                         "'Bande-annonce'")
+    ap.set_defaults(no_drop_trailers=False)
+    ap.add_argument("-n", "--dry-run", action="store_true",
+                    help="print the plan, change nothing")
+    args = ap.parse_args()
+
+    if not args.dir.is_dir():
+        sys.exit("error: not a directory: %s" % args.dir)
+
+    chan_title, items = load_feed(args.feed)
+    drop_patterns = compile_drop_patterns(args)
+    by_title = {}
+    for it in items:
+        by_title.setdefault(it["norm"], []).append(it)
+
+    album = None if args.keep_album else (args.album or chan_title or None)
+
+    files = sorted(p for p in args.dir.iterdir()
+                   if p.suffix.lower() in AUDIO_EXTS)
+    if not files:
+        sys.exit("error: no audio files in %s" % args.dir)
+
+    matched, unmatched, dropped, claimed = [], [], [], {}
+    for path in files:
+        tags = mutagen.File(path, easy=True)
+        if tags is None:
+            sys.exit("error: unreadable audio file: %s" % path.name)
+        cands = title_candidates(path, tags)
+        item = None
+        for cand in cands:
+            hits = by_title.get(norm(cand), [])
+            if len(hits) > 1:
+                sys.exit("error: title %r is ambiguous in the feed (%d items)"
+                         % (cand, len(hits)))
+            if hits:
+                item = hits[0]
+                break
+        if item is None:
+            if should_drop(drop_patterns, *cands):
+                dropped.append((path, None))
+                continue
+            unmatched.append((path, tags))
+            continue
+        if should_drop(drop_patterns, item["title"], *cands):
+            dropped.append((path, item))
+            continue
+        if item["seq"] in claimed:
+            sys.exit("error: %s and %s both match feed item %r"
+                     % (claimed[item["seq"]].name, path.name, item["title"]))
+        claimed[item["seq"]] = path
+        matched.append((path, item))
+
+    if unmatched and not args.allow_unmatched:
+        sys.exit("error: %d file(s) not found in the feed "
+                 "(use --allow-unmatched to number them first):\n  %s"
+                 % (len(unmatched), "\n  ".join(p.name for p, _ in unmatched)))
+
+    def unmatched_key(entry):
+        path, tags = entry
+        trck = (tags.get("tracknumber") or [""])[0].split("/")[0]
+        return (0, int(trck)) if trck.isdigit() else (1, path.stat().st_mtime)
+
+    ordered = [(p, None) for p, _ in sorted(unmatched, key=unmatched_key)]
+    ordered += [(p, it) for p, it in sorted(matched, key=lambda e: e[1]["seq"])]
+
+    total = len(ordered)
+    width = max(2, len(str(total)))
+    plan = []
+    for n, (path, item) in enumerate(ordered, 1):
+        newname = "%0*d_%s%s" % (width, n, PREFIX_RE.sub("", path.stem),
+                                 path.suffix)
+        plan.append((n, path, item, newname))
+
+    finals = [newname for _, _, _, newname in plan]
+    if len(set(finals)) != len(finals):
+        sys.exit("error: renaming would collide (files differing only in "
+                 "their numeric prefix)")
+
+    namew = max(len(p.name) for p in files)
+    for path, item in dropped:
+        title = item["title"] if item else PREFIX_RE.sub("", path.stem)
+        print("drop  %s  %-*s (%s)" % (
+            item["pub"].date().isoformat() if item and item["pub"] else "—",
+            namew,
+            path.name,
+            title,
+        ))
+    for n, path, item, newname in plan:
+        pub = item["pub"].date().isoformat() if item and item["pub"] else "—"
+        print("%*d  %s  %-*s -> %s" % (width, n, pub, namew, path.name, newname))
+    if album is not None:
+        print("album: %r on all %d files" % (album, total))
+    if args.dry_run:
+        print("dry run: nothing changed")
+        return
+
+    for n, path, item, _ in plan:
+        pub = item["pub"] if item else None
+        ext = path.suffix.lower()
+        if ext == ".mp3":
+            save_mp3(path, n, total, album, pub)
+        elif ext in (".m4a", ".m4b"):
+            save_mp4(path, n, total, album, pub)
+        else:
+            save_other(path, n, total, album, pub)
+
+    for path, _ in dropped:
+        path.unlink()
+
+    tmp = []
+    for i, (n, path, item, newname) in enumerate(plan):
+        if path.name == newname:
+            continue
+        t = path.with_name(".renum.%d.tmp" % i)
+        path.rename(t)
+        tmp.append((t, path.with_name(newname)))
+    for t, final in tmp:
+        if final.exists():
+            sys.exit("error: refusing to overwrite %s" % final)
+        t.rename(final)
+
+    print("done: %d files tagged, %d renamed, %d deleted"
+          % (total, len(tmp), len(dropped)))
+
+
+if __name__ == "__main__":
+    main()
