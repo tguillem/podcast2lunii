@@ -1,0 +1,73 @@
+"""Prepare a downloaded podcast dir for packing:
+ - glob audio files (NN_ prefix = play order from podcast-renumber)
+ - transcode each to 44.1kHz mono 64kbps MP3 (matches reference packs)
+ - derive a clean spoken episode title (text after ' : ', unicode-normalized)
+Writes build/<slug>/audio/NN.mp3 and build/<slug>/titles.json
+"""
+import json
+import re
+import subprocess
+import sys
+import unicodedata
+from pathlib import Path
+
+AUDIO_EXTS = {".mp3", ".m4a", ".m4b", ".ogg", ".opus", ".flac"}
+PREFIX_RE = re.compile(r"^(\d+)_")
+
+
+def clean_title(stem, show):
+    s = PREFIX_RE.sub("", stem)
+    # fold yt-dlp fullwidth sanitizations
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace("⧸", "/").replace("⧹", "\\")
+    s = " ".join(s.split())
+    # episode title = text after the LAST ' : ' separator (the "N/M : Title")
+    parts = re.split(r"\s*[:：]\s*", s)
+    ep = parts[-1].strip() if len(parts) > 1 else s
+    # strip a leading "Show N/M" if it still leads
+    return ep
+
+
+def main():
+    src = Path(sys.argv[1])
+    slug = sys.argv[2]
+    show_title = sys.argv[3]
+    outdir = Path("build") / slug
+    (outdir / "audio").mkdir(parents=True, exist_ok=True)
+
+    files = sorted(p for p in src.iterdir()
+                   if p.suffix.lower() in AUDIO_EXTS)
+    m = re.match(r"^(\d+)_", files[0].name)
+    print(f"{len(files)} source files")
+
+    episodes = []
+    for i, p in enumerate(files, 1):
+        num = int(PREFIX_RE.match(p.name).group(1)) if PREFIX_RE.match(p.name) else i
+        out = outdir / "audio" / f"{i:02d}.mp3"
+        # Device (FS) transfer rejects MP3s carrying ID3 tags, so strip them:
+        # -map_metadata -1 drops stream/format metadata; -write_id3v2/v1 0
+        # stops libmp3lame from re-emitting an ID3 header/footer.
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(p),
+               "-map", "0:a:0", "-map_metadata", "-1",
+               "-ar", "44100", "-ac", "1", "-b:a", "64k",
+               "-codec:a", "libmp3lame",
+               "-id3v2_version", "0", "-write_id3v1", "0", str(out)]
+        subprocess.run(cmd, check=True)
+        # duration
+        dur = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(out)],
+            capture_output=True, text=True).stdout.strip()
+        title = clean_title(p.stem, show_title)
+        episodes.append({"n": i, "src": p.name, "title": title,
+                         "audio": str(out), "duration_s": round(float(dur), 1)})
+        print(f"  {i:02d}  {float(dur)/60:5.1f}min  {title}")
+
+    meta = {"show_title": show_title, "slug": slug, "episodes": episodes}
+    (outdir / "titles.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2))
+    print(f"wrote {outdir/'titles.json'}")
+
+
+if __name__ == "__main__":
+    main()

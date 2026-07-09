@@ -1,0 +1,5 @@
+#!/bin/sh
+# podcast2lunii — one-command wrapper: podcast folder -> Lunii pack .zip
+# See scripts/podcast2lunii.py for options.
+here=$(dirname -- "$(readlink -f -- "$0")")
+exec "$here/venv/bin/python" "$here/scripts/podcast2lunii.py" "$@"
