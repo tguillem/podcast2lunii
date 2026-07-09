@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Number a downloaded podcast directory by episode order (oldest = track 1).
+"""Number a downloaded podcast directory into play order (part 1 = track 1).
 
-Episode order uses explicit 'N/M' numbering in item titles when every item
-carries one (e.g. "Tina ... 3/10 : ..."). Otherwise, the RSS item list
-is reversed (feeds list newest first -> oldest first).
+Episode order, highest priority first:
+  1. An 'N/M' series in the item titles (e.g. "Tina ... 3/10 : ...") -> by N
+     ascending, so part 1 is first, with any un-numbered extras (e.g. a
+     "Bonus") kept after. The title number wins even when publication order
+     would play the story backwards.
+  2. Else the RSS item list reversed (feeds list newest first -> oldest first).
 Each audio file is matched to a feed item by episode title, then gets:
 
-  * deletion of French trailer items by default unless --no-drop-trailers is
-    used
+  * deletion of items that are not part of the story by default (French
+    'Bande-annonce' trailers, plus un-numbered extras inside a numbered
+    series); pass --no-drop-trailers to keep them
   * tracknumber n/total (ID3 TRCK / MP4 trkn / vorbis TRACKNUMBER)
   * album tag set to the feed channel title (or --album NAME)
   * a date tag from the item's pubDate, only if the file has none
@@ -73,12 +77,19 @@ def load_feed(src):
     #      with un-numbered extras (e.g. a "Bonus") kept after, oldest first.
     #   2. else the RSS list reversed (newest-first feed -> oldest first).
     ranks = None
-
     marks = [EPNUM_RE.search(it["norm"]) for it in items]
-    if (ranks is None and items and all(marks)
-            and len({m.group(2) for m in marks}) == 1
-            and len({int(m.group(1)) for m in marks}) == len(marks)):
-        ranks = sorted(range(len(items)), key=lambda i: int(marks[i].group(1)))
+    series_ms = [m.group(2) for m in marks if m]
+    dom_m = max(set(series_ms), key=series_ms.count) if series_ms else None
+    if dom_m is not None and series_ms.count(dom_m) * 2 > len(items):
+        numbered = sorted(
+            (i for i, m in enumerate(marks) if m and m.group(2) == dom_m),
+            key=lambda i: int(marks[i].group(1)))
+        num_set = set(numbered)
+        rest = [i for i in range(len(items) - 1, -1, -1) if i not in num_set]
+        for i in rest:
+            items[i]["extra"] = True   # un-numbered item within a numbered story
+        ranks = numbered + rest        # extras kept last only with --no-drop-trailers
+
     if ranks is None:
         ranks = range(len(items) - 1, -1, -1)
     for seq, i in enumerate(ranks):
@@ -161,11 +172,11 @@ def main():
                          "(by existing track tag, then mtime) instead of aborting")
     ap.add_argument("--drop-trailers", action="store_false",
                     dest="no_drop_trailers",
-                    help="delete French trailer items whose title starts with "
-                         "'Bande-annonce' (default)")
+                    help="delete non-story items: 'Bande-annonce' trailers and "
+                         "un-numbered extras inside a numbered series (default)")
     ap.add_argument("--no-drop-trailers", action="store_true",
-                    help="keep French trailer items whose title starts with "
-                         "'Bande-annonce'")
+                    help="keep 'Bande-annonce' trailers and un-numbered extras "
+                         "inside a numbered series")
     ap.set_defaults(no_drop_trailers=False)
     ap.add_argument("-n", "--dry-run", action="store_true",
                     help="print the plan, change nothing")
@@ -208,7 +219,8 @@ def main():
                 continue
             unmatched.append((path, tags))
             continue
-        if should_drop(drop_patterns, item["title"], *cands):
+        if should_drop(drop_patterns, item["title"], *cands) or (
+                item.get("extra") and not args.no_drop_trailers):
             dropped.append((path, item))
             continue
         if item["seq"] in claimed:
