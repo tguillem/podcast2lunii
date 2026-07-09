@@ -29,6 +29,8 @@ COMMON_KEY = bytes(
     [0x91, 0xBD, 0x7A, 0x0A, 0xA7, 0x54, 0x40, 0xA9,
      0xBB, 0xD4, 0x9D, 0x6C, 0xE0, 0xDC, 0xC0, 0xE3]
 )
+CLEAR_FILES = {"ni", "nm", ".cleartext"}
+NO_COPY_FILES = {".cleartext"}
 
 
 class PackError(RuntimeError):
@@ -563,17 +565,28 @@ def add_boot_file_v2(pack_dir: Path, uuid_block: bytes) -> None:
     (pack_dir / "bt").write_bytes(cipher_first_block_specific_key_v2(ri, key))
 
 
-def count_copy_payload(pack_dir: Path) -> tuple[int, int]:
+def should_copy(path: Path) -> bool:
+    return path.name not in NO_COPY_FILES
+
+
+def should_cipher(path: Path) -> bool:
+    return path.name not in CLEAR_FILES
+
+
+def count_copy_payload(pack_dir: Path, *, include_boot: bool = False) -> tuple[int, int]:
     count = 0
     total = 0
     for path in pack_dir.rglob("*"):
-        if path.is_file() and path.name != ".cleartext":
+        if path.is_file() and should_copy(path):
             count += 1
             total += path.stat().st_size
+    if include_boot:
+        count += 1
+        total += 64
     return count, total
 
 
-def copy_pack_payload(src: Path, dst: Path) -> None:
+def copy_pack_payload(src: Path, dst: Path, *, cipher_v2: bool = False) -> None:
     for root, dirs, files in os.walk(src):
         root_path = Path(root)
         rel_root = root_path.relative_to(src)
@@ -582,9 +595,14 @@ def copy_pack_payload(src: Path, dst: Path) -> None:
         for dirname in dirs:
             (target_root / dirname).mkdir(exist_ok=True)
         for filename in files:
-            if filename == ".cleartext":
+            source = root_path / filename
+            if not should_copy(source):
                 continue
-            shutil.copy2(root_path / filename, target_root / filename)
+            target = target_root / filename
+            if cipher_v2 and should_cipher(source):
+                target.write_bytes(cipher_first_block_common_key(source.read_bytes()))
+            else:
+                shutil.copy2(source, target)
 
 
 def plan_index(entries: list[uuid.UUID], pack_uuid: uuid.UUID, replace: bool) -> tuple[list[uuid.UUID], str]:
@@ -597,14 +615,15 @@ def plan_index(entries: list[uuid.UUID], pack_uuid: uuid.UUID, replace: bool) ->
     return new_entries, action
 
 
-def install(summary: FsBuildSummary, mount: Path, entries: list[uuid.UUID], replace: bool) -> Path:
+def install(summary: FsBuildSummary, mount: Path, device: DeviceInfo, entries: list[uuid.UUID], replace: bool) -> Path:
     content = mount / ".content"
     target = content / summary.pack8
     tmp = content / f".{summary.pack8}.tmp.{os.getpid()}.{int(time.time())}"
     if tmp.exists():
         shutil.rmtree(tmp)
 
-    copy_pack_payload(summary.work_dir, tmp)
+    copy_pack_payload(summary.work_dir, tmp, cipher_v2=True)
+    add_boot_file_v2(tmp, device.uuid_block)
     if target.exists():
         if not replace:
             shutil.rmtree(tmp)
@@ -640,14 +659,13 @@ def main(argv: list[str]) -> int:
         pack = read_archive(args.pack_zip)
         summary = build_fs_pack(pack)
         device = verify_mount(args.mount)
-        add_boot_file_v2(summary.work_dir, device.uuid_block)
 
         entries = read_pack_index(args.mount / ".pi")
         new_entries, pi_action = plan_index(entries, summary.pack_uuid, args.replace)
         target = args.mount / ".content" / summary.pack8
         if target.exists() and not args.replace:
             fail(f"target pack folder already exists; pass --replace to replace it: {target}")
-        files, bytes_total = count_copy_payload(summary.work_dir)
+        files, bytes_total = count_copy_payload(summary.work_dir, include_boot=True)
         free_bytes = shutil.disk_usage(args.mount).free
         if free_bytes < bytes_total:
             fail(f"not enough free space on device: need {bytes_total} bytes, have {free_bytes}")
@@ -669,7 +687,7 @@ def main(argv: list[str]) -> int:
             print("dry-run: no device writes performed")
             return 0
 
-        backup = install(summary, args.mount, entries, args.replace)
+        backup = install(summary, args.mount, device, entries, args.replace)
         print(f"installed: {target}")
         print(f".pi backup: {backup}")
         return 0

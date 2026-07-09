@@ -5,7 +5,8 @@ One deterministic pass, no LLM in the loop:
   folder of numbered audio  ->  transcode + title-voice TTS + numbered covers
                             ->  story.json menu graph  ->  <slug>.zip
 
-The only input the script cannot derive is the cover art. Supply it yourself
+The only input the script cannot derive is the cover art. A URL feed uses the
+feed's own RSS artwork when it declares any; otherwise pass the image yourself
 with --cover-file or --cover-url.
 
 usage:
@@ -28,6 +29,7 @@ import sys
 import unicodedata
 import uuid
 import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import requests
@@ -42,9 +44,11 @@ MODEL = ROOT / "voices" / "fr_FR-siwis-medium.onnx"
 YTDLP = ROOT / "venv" / "bin" / "yt-dlp"
 YTDLP_PODCAST = ROOT.parent / "yt-dlp-podcast"      # the user's existing script
 NS = uuid.UUID("1b671a64-40d5-491e-99b0-da01ff1f3341")
+ITUNES_IMAGE = "{http://www.itunes.com/dtds/podcast-1.0.dtd}image"
 
 AUDIO_EXTS = {".mp3", ".m4a", ".m4b", ".ogg", ".oga", ".opus", ".flac"}
 PREFIX_RE = re.compile(r"^\d+_")
+AUDIO_LEAD_IN_MS = 500
 
 
 # ---------------------------------------------------------------- helpers
@@ -65,6 +69,10 @@ def det_uuid(slug, key):
     return str(uuid.uuid5(NS, f"{slug}/{key}"))
 
 
+def has_audio_files(folder):
+    return folder.is_dir() and any(p.suffix.lower() in AUDIO_EXTS for p in folder.iterdir())
+
+
 def download_feed(url, download_dir, extra):
     """Run the user's yt-dlp-podcast to fetch+renumber a feed; return its folder.
 
@@ -80,6 +88,10 @@ def download_feed(url, download_dir, extra):
     name = (name[0].strip() if name else "")
     if not name:
         sys.exit("could not read playlist title from %s" % url)
+    folder = download_dir / name
+    if has_audio_files(folder) and not os.access(download_dir, os.W_OK):
+        print("download dir is read-only; using existing folder: %s" % folder)
+        return folder
     script = YTDLP_PODCAST if YTDLP_PODCAST.exists() else shutil.which("yt-dlp-podcast")
     if not script:
         sys.exit("yt-dlp-podcast not found (looked at %s and PATH)" % YTDLP_PODCAST)
@@ -89,7 +101,6 @@ def download_feed(url, download_dir, extra):
     print("downloading %r -> %s" % (name, download_dir))
     subprocess.run([str(script), url, *extra], cwd=str(download_dir),
                    env=env, check=True)
-    folder = download_dir / name
     if not folder.is_dir():
         sys.exit("expected download folder not found: %s" % folder)
     return folder
@@ -99,6 +110,7 @@ def transcode(src, out):
     """-> 44.1kHz mono 64kbps ID3-free MP3 (device-ready)."""
     subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(src),
                     "-map", "0:a:0", "-map_metadata", "-1",
+                    "-af", f"adelay={AUDIO_LEAD_IN_MS}:all=1",
                     "-ar", "44100", "-ac", "1", "-b:a", "64k",
                     "-codec:a", "libmp3lame",
                     "-id3v2_version", "0", "-write_id3v1", "0", str(out)],
@@ -111,6 +123,7 @@ def tts_mp3(text, out):
                    input=text.encode("utf-8"), check=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(wav),
+                    "-af", f"adelay={AUDIO_LEAD_IN_MS}:all=1",
                     "-ar", "44100", "-ac", "1", "-b:a", "64k",
                     "-codec:a", "libmp3lame",
                     "-id3v2_version", "0", "-write_id3v1", "0", str(out)],
@@ -119,19 +132,69 @@ def tts_mp3(text, out):
     return out.read_bytes()
 
 
+def rss_cover_url(feed_url):
+    """Best-effort artwork URL from an RSS feed."""
+    try:
+        r = requests.get(feed_url, timeout=30)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+    except (requests.RequestException, ET.ParseError) as e:
+        print("  cover: RSS artwork unavailable: %s" % e, file=sys.stderr)
+        return None
+
+    channel = root.find("channel")
+    if channel is None:
+        return None
+
+    node = channel.find(ITUNES_IMAGE)
+    if node is not None and node.get("href"):
+        return node.get("href").strip()
+
+    image = channel.find("image")
+    if image is not None:
+        url = image.findtext("url")
+        if url and url.strip():
+            return url.strip()
+
+    for item in channel.findall("item"):
+        node = item.find(ITUNES_IMAGE)
+        if node is not None and node.get("href"):
+            return node.get("href").strip()
+
+    return None
+
+
 def resolve_cover(args, title, dest):
-    """Return cover art supplied by a local path or URL."""
+    """Return cover art from RSS or an explicitly supplied path or URL."""
     if args.cover_file:
-        return Image.open(args.cover_file)
+        img = Image.open(args.cover_file)
+        img.load()
+        return img
     url = args.cover_url
+    if url is None and str(args.src).startswith(("http://", "https://")):
+        url = rss_cover_url(args.src)
+        if url:
+            print("  cover: from RSS artwork")
+
     if url is None:
         sys.exit(
-            "No cover art for %r. Pass --cover-file PATH or --cover-url URL."
-            % title
+            "No cover art for %r: the feed declares none, or the source is a "
+            "local folder.\nPass --cover-file PATH or --cover-url URL." % title
         )
-    data = requests.get(url, timeout=40).content
+
+    try:
+        r = requests.get(url, timeout=40)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        sys.exit("Cover download failed for %s: %s" % (url, e))
+    data = r.content
     dest.write_bytes(data)
-    return Image.open(io.BytesIO(data))
+    try:
+        img = Image.open(io.BytesIO(data))
+        img.load()
+        return img
+    except OSError as e:
+        sys.exit("Cover is not a readable image from %s: %s" % (url, e))
 
 
 # ---------------------------------------------------------------- assets/graph

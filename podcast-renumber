@@ -12,6 +12,9 @@ Each audio file is matched to a feed item by episode title, then gets:
   * deletion of items that are not part of the story by default (French
     'Bande-annonce' trailers, plus un-numbered extras inside a numbered
     series); pass --no-drop-trailers to keep them
+  * deletion of the redundant copy when the feed lists one episode twice
+    (same title and same audio URL under two <guid>s, so yt-dlp's archive
+    cannot skip it); this one always applies
   * tracknumber n/total (ID3 TRCK / MP4 trkn / vorbis TRACKNUMBER)
   * album tag set to the feed channel title (or --album NAME)
   * a date tag from the item's pubDate, only if the file has none
@@ -66,9 +69,11 @@ def load_feed(src):
         if not title:
             sys.exit("error: feed item without a title")
         pubdate = it.findtext("pubDate")
+        enc = it.find("enclosure")
         items.append({
             "title": title,
             "norm": norm(title),
+            "enc": (enc.get("url") or "").strip() if enc is not None else "",
             "pub": parsedate_to_datetime(pubdate) if pubdate else None,
         })
 
@@ -191,6 +196,17 @@ def main():
     for it in items:
         by_title.setdefault(it["norm"], []).append(it)
 
+    # A feed can list the same episode twice under two <guid>s (same title,
+    # same enclosure), which yt-dlp's archive cannot dedupe: keep the item
+    # that plays first and let the redundant download be dropped below.
+    # Same title but different audio stays ambiguous, and is an error.
+    dup_titles = set()
+    for key, hits in by_title.items():
+        if len(hits) > 1 and hits[0]["enc"] and all(
+                it["enc"] == hits[0]["enc"] for it in hits):
+            by_title[key] = [min(hits, key=lambda it: it["seq"])]
+            dup_titles.add(key)
+
     album = None if args.keep_album else (args.album or chan_title or None)
 
     files = sorted(p for p in args.dir.iterdir()
@@ -224,6 +240,9 @@ def main():
             dropped.append((path, item))
             continue
         if item["seq"] in claimed:
+            if item["norm"] in dup_titles:  # duplicate feed entry, same audio
+                dropped.append((path, item))
+                continue
             sys.exit("error: %s and %s both match feed item %r"
                      % (claimed[item["seq"]].name, path.name, item["title"]))
         claimed[item["seq"]] = path

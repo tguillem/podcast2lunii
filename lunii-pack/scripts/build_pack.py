@@ -39,6 +39,7 @@ PIPER = ROOT / "venv" / "bin" / "piper"
 MODEL = ROOT / "voices" / "fr_FR-siwis-medium.onnx"
 # fixed namespace -> deterministic UUIDs (re-running yields an identical pack)
 NS = uuid.UUID("1b671a64-40d5-491e-99b0-da01ff1f3341")
+AUDIO_LEAD_IN_MS = 500
 
 
 def det_uuid(slug, key):
@@ -52,6 +53,7 @@ def tts_mp3(text, out_path):
                    input=text.encode("utf-8"), check=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(wav),
+                    "-af", f"adelay={AUDIO_LEAD_IN_MS}:all=1",
                     "-ar", "44100", "-ac", "1", "-b:a", "64k",
                     "-codec:a", "libmp3lame",
                     "-id3v2_version", "0", "-write_id3v1", "0", str(out_path)],

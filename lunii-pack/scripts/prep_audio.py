@@ -13,6 +13,7 @@ from pathlib import Path
 
 AUDIO_EXTS = {".mp3", ".m4a", ".m4b", ".ogg", ".opus", ".flac"}
 PREFIX_RE = re.compile(r"^(\d+)_")
+AUDIO_LEAD_IN_MS = 500
 
 
 def clean_title(stem, show):
@@ -49,6 +50,7 @@ def main():
         # stops libmp3lame from re-emitting an ID3 header/footer.
         cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(p),
                "-map", "0:a:0", "-map_metadata", "-1",
+               "-af", f"adelay={AUDIO_LEAD_IN_MS}:all=1",
                "-ar", "44100", "-ac", "1", "-b:a", "64k",
                "-codec:a", "libmp3lame",
                "-id3v2_version", "0", "-write_id3v1", "0", str(out)]
