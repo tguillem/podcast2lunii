@@ -1,0 +1,6 @@
+#!/bin/sh
+# install_pack — one-command wrapper: install a Lunii pack .zip onto a device.
+# usage: ./install_pack PACK.zip --mount /media/you/LUNII (--dry-run | --yes)
+# See scripts/install_pack.py for options.
+here=$(dirname -- "$(readlink -f -- "$0")")
+exec "$here/venv/bin/python" "$here/scripts/install_pack.py" "$@"
