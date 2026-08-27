@@ -436,11 +436,9 @@ def source_import_result(python: Path | None) -> Result:
         return Result("source_import", "MISSING", "cannot import project source without the virtual environment")
     sources = [
         ROOT / "podcast-renumber",
-        ROOT / "lunii-pack" / "scripts" / "build_pack.py",
         ROOT / "lunii-pack" / "scripts" / "install_pack.py",
         ROOT / "lunii-pack" / "scripts" / "lunii_image.py",
         ROOT / "lunii-pack" / "scripts" / "podcast2lunii.py",
-        ROOT / "lunii-pack" / "scripts" / "prep_audio.py",
     ]
     missing = [str(path) for path in sources if not path.is_file()]
     if missing:
