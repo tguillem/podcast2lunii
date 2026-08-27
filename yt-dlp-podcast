@@ -48,11 +48,21 @@ fi
 shift
 
 # Album directory, sanitized exactly as yt-dlp would write it (%(...)S)
-dir=$("$ytdlp" --flat-playlist -I1 --print '%(playlist_title)S' -- "$url" | head -n1)
+dir=$("$ytdlp" --flat-playlist -I1 --print '%(playlist_title)S' \
+        --output-na-placeholder '' -- "$url" | head -n1)
 if [ -z "$dir" ]; then
     echo "yt-dlp-podcast: could not read playlist title from $url" >&2
     exit 1
 fi
+
+# %(playlist_title)S folds path separators but leaves a bare '.' or '..'
+# intact, and the result is used unquoted as a directory by yt-dlp, by
+# --download-archive, and by podcast-renumber.
+case "$dir" in
+    .|..|*/*)
+        echo "yt-dlp-podcast: refusing unusable playlist title: $dir" >&2
+        exit 1 ;;
+esac
 
 # '%' in the title would otherwise be parsed as an output-template field
 esc=$(printf '%s' "$dir" | sed 's/%/%%/g')

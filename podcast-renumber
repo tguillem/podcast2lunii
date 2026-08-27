@@ -14,10 +14,11 @@ Episode order, highest priority first:
   2. Else the RSS item list reversed (feeds list newest first -> oldest first).
 Each audio file is matched to a feed item by episode title, then gets:
 
-  * deletion of items that are not part of the story by default (French
-    'Bande-annonce' trailers, plus un-numbered extras inside a numbered
-    series); pass --no-drop-trailers to keep them
-  * deletion of the redundant copy when the feed lists one episode twice
+  * items that are not part of the story moved aside into '.excluded/' by
+    default (French 'Bande-annonce' trailers, plus un-numbered extras inside
+    a numbered series); pass --no-drop-trailers to keep them in place.
+    Nothing is ever deleted -- move a file back out of '.excluded/' to undo.
+  * the redundant copy moved aside when the feed lists one episode twice
     (same title and same audio URL under two <guid>s, so yt-dlp's archive
     cannot skip it); this one always applies
   * tracknumber n/total (ID3 TRCK / MP4 trkn / vorbis TRACKNUMBER)
@@ -31,21 +32,35 @@ usage: podcast-renumber --feed URL_or_FILE [options] DIR
 """
 
 import argparse
+import os
 import re
 import sys
 import unicodedata
-import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.request import Request, urlopen
 
 import mutagen
+from defusedxml import ElementTree as ET
+from defusedxml.common import DefusedXmlException
 from mutagen.id3 import ID3, ID3NoHeaderError, TALB, TDRC, TRCK
 from mutagen.mp4 import MP4
 
 AUDIO_EXTS = {".mp3", ".m4a", ".m4b", ".ogg", ".oga", ".opus", ".flac"}
 PREFIX_RE = re.compile(r"^\d+_")
 EPNUM_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
+DATE_LIKE_RE = re.compile(r"\bdu\s+\d{1,2}\s*/\s*\d{1,2}")
+MAX_FEED_BYTES = 16 * 1024 * 1024
+EXCLUDED_DIRNAME = ".excluded"
+STAGING_GLOB = ".renum.*.tmp"
+
+
+def read_capped(response, limit, source):
+    """Read at most ``limit`` bytes, refusing a larger or unbounded response."""
+    data = response.read(limit + 1)
+    if len(data) > limit:
+        sys.exit("error: response from %s exceeds %d bytes" % (source, limit))
+    return data
 
 
 def norm(s):
@@ -62,10 +77,14 @@ def load_feed(src):
     """Return (channel_title, items oldest-first: [{title, norm, pub, seq}])."""
     if re.match(r"^https?://", src):
         req = Request(src, headers={"User-Agent": "podcast-renumber/1.0"})
-        data = urlopen(req, timeout=30).read()
+        with urlopen(req, timeout=30) as response:
+            data = read_capped(response, MAX_FEED_BYTES, src)
     else:
         data = Path(src).read_bytes()
-    channel = ET.fromstring(data).find("channel")
+    try:
+        channel = ET.fromstring(data).find("channel")
+    except (ET.ParseError, DefusedXmlException, ValueError) as exc:
+        sys.exit("error: could not parse feed %s: %s" % (src, exc))
     if channel is None:
         sys.exit("error: not an RSS feed (no <channel>): %s" % src)
     items = []
@@ -87,18 +106,22 @@ def load_feed(src):
     #      with un-numbered extras (e.g. a "Bonus") kept after, oldest first.
     #   2. else the RSS list reversed (newest-first feed -> oldest first).
     ranks = None
-    marks = [EPNUM_RE.search(it["norm"]) for it in items]
+    marks = [None if DATE_LIKE_RE.search(it["norm"])
+             else EPNUM_RE.search(it["norm"]) for it in items]
     series_ms = [m.group(2) for m in marks if m]
     dom_m = max(set(series_ms), key=series_ms.count) if series_ms else None
     if dom_m is not None and series_ms.count(dom_m) * 2 > len(items):
         numbered = sorted(
             (i for i, m in enumerate(marks) if m and m.group(2) == dom_m),
             key=lambda i: int(marks[i].group(1)))
+        if not is_part_series(marks, numbered, int(dom_m)):
+            numbered = []
         num_set = set(numbered)
-        rest = [i for i in range(len(items) - 1, -1, -1) if i not in num_set]
-        for i in rest:
-            items[i]["extra"] = True   # un-numbered item within a numbered story
-        ranks = numbered + rest        # extras kept last only with --no-drop-trailers
+        if numbered:
+            rest = [i for i in range(len(items) - 1, -1, -1) if i not in num_set]
+            for i in rest:
+                items[i]["extra"] = True   # un-numbered item in a numbered story
+            ranks = numbered + rest    # extras last, and only with --no-drop-trailers
 
     if ranks is None:
         ranks = range(len(items) - 1, -1, -1)
@@ -106,6 +129,27 @@ def load_feed(src):
         items[i]["seq"] = seq
 
     return (channel.findtext("title") or "").strip(), items
+
+
+def is_part_series(marks, numbered, total_parts):
+    """True when the 'N/M' matches really are parts 1..M of one story.
+
+    Without this, a date is read as a part number: "Bulletin du 04/03"
+    yields N=4, M=3, so a feed whose window straddles a month boundary looks
+    like a 3-part series and the minority month becomes un-numbered 'extras'.
+    A real series numbers its parts 1..M, each exactly once.
+    """
+    if total_parts < 2:
+        return False
+    ns = [int(marks[i].group(1)) for i in numbered]
+    if len(set(ns)) != len(ns):            # a part number repeats
+        return False
+    if any(n < 1 or n > total_parts for n in ns):
+        return False                       # a part number outside 1..M
+    ordered = sorted(ns)
+    # A feed usually exposes only a window of a long series, so do not demand
+    # every part -- but the parts that are present must be consecutive.
+    return ordered == list(range(ordered[0], ordered[0] + len(ordered)))
 
 
 def title_candidates(path, tags):
@@ -126,6 +170,23 @@ def compile_drop_patterns(args):
 
 def should_drop(patterns, *titles):
     return any(p.search(norm(t)) for p in patterns for t in titles if t)
+
+
+def move_excluded(path, dest_dir):
+    """Move a non-story file out of the numbering set. Never deletes."""
+    if dest_dir.is_symlink() or (dest_dir.exists() and not dest_dir.is_dir()):
+        sys.exit("error: %s must be a real directory" % dest_dir)
+    dest_dir.mkdir(exist_ok=True)
+    target = dest_dir / path.name
+    counter = 1
+    while target.exists():
+        target = dest_dir / ("%s.%d%s" % (path.stem, counter, path.suffix))
+        counter += 1
+    try:
+        path.rename(target)
+    except OSError as exc:
+        sys.exit("error: could not move %s into %s/: %s" % (path.name, dest_dir.name, exc))
+    return target
 
 
 def save_mp3(path, n, total, album, pub):
@@ -182,8 +243,9 @@ def main():
                          "(by existing track tag, then mtime) instead of aborting")
     ap.add_argument("--drop-trailers", action="store_false",
                     dest="no_drop_trailers",
-                    help="delete non-story items: 'Bande-annonce' trailers and "
-                         "un-numbered extras inside a numbered series (default)")
+                    help="move non-story items aside into .excluded/: "
+                         "'Bande-annonce' trailers and un-numbered extras "
+                         "inside a numbered series (default; never deletes)")
     ap.add_argument("--no-drop-trailers", action="store_true",
                     help="keep 'Bande-annonce' trailers and un-numbered extras "
                          "inside a numbered series")
@@ -216,10 +278,19 @@ def main():
 
     files = sorted(p for p in args.dir.iterdir()
                    if p.suffix.lower() in AUDIO_EXTS)
+    # Checked before the empty-directory exit: staging names carry no audio
+    # suffix, so a run interrupted after staging everything looks like an empty
+    # directory and would otherwise report that instead of the recoverable files.
+    stale = sorted(args.dir.glob(STAGING_GLOB))
+    if stale:
+        sys.exit("error: %d staging file(s) left by an interrupted run; "
+                 "rename them back before re-running:\n  %s"
+                 % (len(stale), "\n  ".join(p.name for p in stale)))
+
     if not files:
         sys.exit("error: no audio files in %s" % args.dir)
 
-    matched, unmatched, dropped, claimed = [], [], [], {}
+    matched, unmatched, excluded, claimed = [], [], [], {}
     for path in files:
         tags = mutagen.File(path, easy=True)
         if tags is None:
@@ -236,17 +307,17 @@ def main():
                 break
         if item is None:
             if should_drop(drop_patterns, *cands):
-                dropped.append((path, None))
+                excluded.append((path, None))
                 continue
             unmatched.append((path, tags))
             continue
         if should_drop(drop_patterns, item["title"], *cands) or (
                 item.get("extra") and not args.no_drop_trailers):
-            dropped.append((path, item))
+            excluded.append((path, item))
             continue
         if item["seq"] in claimed:
             if item["norm"] in dup_titles:  # duplicate feed entry, same audio
-                dropped.append((path, item))
+                excluded.append((path, item))
                 continue
             sys.exit("error: %s and %s both match feed item %r"
                      % (claimed[item["seq"]].name, path.name, item["title"]))
@@ -280,13 +351,14 @@ def main():
                  "their numeric prefix)")
 
     namew = max(len(p.name) for p in files)
-    for path, item in dropped:
+    for path, item in excluded:
         title = item["title"] if item else PREFIX_RE.sub("", path.stem)
-        print("drop  %s  %-*s (%s)" % (
+        print("skip  %s  %-*s (%s) -> %s/" % (
             item["pub"].date().isoformat() if item and item["pub"] else "—",
             namew,
             path.name,
             title,
+            EXCLUDED_DIRNAME,
         ))
     for n, path, item, newname in plan:
         pub = item["pub"].date().isoformat() if item and item["pub"] else "—"
@@ -307,23 +379,47 @@ def main():
         else:
             save_other(path, n, total, album, pub)
 
-    for path, _ in dropped:
-        path.unlink()
+    for path, _ in excluded:
+        move_excluded(path, args.dir / EXCLUDED_DIRNAME)
 
-    tmp = []
-    for i, (n, path, item, newname) in enumerate(plan):
-        if path.name == newname:
-            continue
-        t = path.with_name(".renum.%d.tmp" % i)
-        path.rename(t)
-        tmp.append((t, path.with_name(newname)))
-    for t, final in tmp:
-        if final.exists():
+    # Refuse before touching anything if a destination is already occupied by
+    # a file that is not itself part of the plan.
+    sources = {path for _, path, _, _ in plan}
+    for _, path, _, newname in plan:
+        final = path.with_name(newname)
+        if final.exists() and final not in sources:
             sys.exit("error: refusing to overwrite %s" % final)
-        t.rename(final)
 
-    print("done: %d files tagged, %d renamed, %d deleted"
-          % (total, len(tmp), len(dropped)))
+    # Two reversible phases: stage every rename under a unique name, then move
+    # each into place. Any failure rewinds whatever already happened, so an
+    # interrupted run cannot strand audio under a staging name.
+    staged = []
+    try:
+        for i, (_, path, _, newname) in enumerate(plan):
+            if path.name == newname:
+                continue
+            staging = path.with_name(".renum.%d.%d.tmp" % (os.getpid(), i))
+            if staging.exists():
+                raise FileExistsError("staging file in the way: %s" % staging)
+            staged.append((staging, path, path.with_name(newname)))
+            path.rename(staging)          # intent recorded before the move
+        for staging, origin, final in staged:
+            staging.rename(final)
+    except BaseException:
+        # Undo committed moves first, then un-stage. Decide from the filesystem
+        # rather than from a log of what succeeded: an interrupt can land
+        # between a rename and any bookkeeping, so only on-disk state is
+        # trustworthy, and a stale log can rename one file over another.
+        for staging, origin, final in reversed(staged):
+            if final.exists() and not staging.exists() and not origin.exists():
+                final.rename(origin)
+        for staging, origin, final in reversed(staged):
+            if staging.exists() and not origin.exists():
+                staging.rename(origin)
+        raise
+
+    print("done: %d files tagged, %d renamed, %d moved to %s/"
+          % (total, len(staged), len(excluded), EXCLUDED_DIRNAME))
 
 
 if __name__ == "__main__":

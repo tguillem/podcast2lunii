@@ -47,12 +47,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         description="Create an isolated venv and install Lunii podcast tools."
     )
     parser.add_argument(
-        "--venv",
-        type=Path,
-        default=DEFAULT_VENV,
-        help=f"virtual environment path (default: {DEFAULT_VENV})",
-    )
-    parser.add_argument(
         "--with-voice",
         action="store_true",
         help="download and verify the approximately 63 MB French Piper voice",
@@ -111,13 +105,13 @@ def validate_existing_venv(path: Path) -> Path:
     if not path.is_dir() or not config_path.is_file() or not python.is_file():
         fail(
             f"{path} exists but is not a usable virtual environment; "
-            "move it aside or choose another path with --venv"
+            "delete it and re-run this script"
         )
     config = read_pyvenv_config(config_path)
     if config.get("include-system-site-packages", "false").lower() != "false":
         fail(
             f"{path} exposes system site packages and cannot prove a clean setup; "
-            "move it aside or choose another path with --venv"
+            "delete it and re-run this script"
         )
     probe = subprocess.run(
         [str(python), "-c", "import sys; print('.'.join(map(str, sys.version_info[:3])))"],
@@ -132,10 +126,23 @@ def validate_existing_venv(path: Path) -> Path:
         version = tuple(int(part) for part in probe.stdout.strip().split(".")[:2])
     except ValueError:
         fail(f"cannot parse Python version reported by {python}: {probe.stdout.strip()!r}")
+    pip_probe = subprocess.run(
+        [str(python), "-m", "pip", "--version"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if pip_probe.returncode != 0:
+        fail(
+            f"{path} has no working pip, so it is only a partial virtual "
+            "environment (an interrupted create leaves this shape); delete it "
+            "and re-run this script. On Debian/Ubuntu, install python3-venv first"
+        )
     if version < MIN_PYTHON:
         fail(
             f"{path} uses Python {probe.stdout.strip()}; Python 3.10 or newer is "
-            "required; move it aside or choose another path with --venv"
+            "required; delete it and re-run this script"
         )
     return python
 
@@ -300,7 +307,7 @@ def run(argv: list[str]) -> int:
             f"{sys.version.split()[0]} at {sys.executable}"
         )
 
-    path = normalized_venv_path(args.venv)
+    path = normalized_venv_path(DEFAULT_VENV)
     wants_voice = args.with_voice or args.force_voice
     voice = load_voice_metadata()
     print(f"Bootstrap interpreter: {sys.version.split()[0]} at {sys.executable}")

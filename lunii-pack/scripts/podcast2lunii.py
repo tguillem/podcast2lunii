@@ -141,7 +141,7 @@ def download_feed(url, download_dir, extra):
     download_dir.mkdir(parents=True, exist_ok=True)
     name = subprocess.run(
         [str(YTDLP), "--flat-playlist", "-I1", "--print",
-         "%(playlist_title)S", url],
+         "%(playlist_title)S", "--output-na-placeholder", "", url],
         capture_output=True, text=True, check=True).stdout.splitlines()
     name = (name[0].strip() if name else "")
     if not name:
@@ -152,6 +152,8 @@ def download_feed(url, download_dir, extra):
         folder.relative_to(download_root)
     except ValueError:
         sys.exit("refusing playlist title that escapes the download directory: %r" % name)
+    if folder == download_root:
+        sys.exit("refusing playlist title that is the download directory itself: %r" % name)
     if has_audio_files(folder) and not os.access(download_dir, os.W_OK):
         print("download dir is read-only; using existing folder: %s" % folder)
         return folder
@@ -180,11 +182,23 @@ def transcode(src, out):
                    check=True)
 
 
+def require_voice():
+    """Fail before any downloading or transcoding if TTS is not installed."""
+    missing = [str(path) for path in (PIPER, MODEL) if not path.exists()]
+    if missing:
+        sys.exit("text-to-speech is not installed; missing:\n  %s\n"
+                 "Run: python3 tools/bootstrap.py --with-voice"
+                 % "\n  ".join(missing))
+
+
 def tts_mp3(text, out):
     wav = out.with_suffix(".wav")
-    subprocess.run([str(PIPER), "-m", str(MODEL), "-f", str(wav)],
-                   input=text.encode("utf-8"), check=True,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    result = subprocess.run([str(PIPER), "-m", str(MODEL), "-f", str(wav)],
+                            input=text.encode("utf-8"), capture_output=True)
+    if result.returncode != 0:
+        sys.exit("piper failed (exit %d) synthesizing %r: %s"
+                 % (result.returncode, text[:60],
+                    result.stderr.decode("utf-8", "replace").strip()))
     subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(wav),
                     "-af", f"adelay={AUDIO_LEAD_IN_MS}:all=1",
                     "-ar", "44100", "-ac", "1", "-b:a", "64k",
@@ -192,6 +206,21 @@ def tts_mp3(text, out):
                     "-id3v2_version", "0", "-write_id3v1", "0", str(out)],
                    check=True)
     wav.unlink(missing_ok=True)
+    return out.read_bytes()
+
+
+def silent_mp3(out, ms=AUDIO_LEAD_IN_MS):
+    """A short silent MP3.
+
+    Every stage must carry audio: STUdio substitutes a built-in blank MP3 for a
+    null, but install_pack.py does not embed one, so a null-audio stage builds a
+    pack that fails at install time. --no-episode-tts uses this instead.
+    """
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                    "-i", "anullsrc=r=44100:cl=mono", "-t", "%.3f" % (ms / 1000.0),
+                    "-b:a", "64k", "-codec:a", "libmp3lame",
+                    "-id3v2_version", "0", "-write_id3v1", "0", str(out)],
+                   check=True)
     return out.read_bytes()
 
 
@@ -288,6 +317,7 @@ def build(args):
     else:
         src = Path(args.src)
     require(src.is_dir(), "source is not a directory: %s" % src)
+    require_voice()
     title = args.title or src.name
     slug = args.slug or slugify(title)
     require(bool(SLUG_RE.fullmatch(slug)),
@@ -313,13 +343,15 @@ def build(args):
     # audio: transcode stories, synthesize titles
     show_aud = assets.add(tts_mp3(title, work / "showtitle.mp3"), "mp3")
     choose_aud = assets.add(tts_mp3(args.menu_prompt, work / "choose.mp3"), "mp3")
+    silent_aud = (assets.add(silent_mp3(work / "silence.mp3"), "mp3")
+                  if args.no_episode_tts else None)
     ep_title_aud, ep_story_aud = [], []
     for i, f in enumerate(files, 1):
         story = work / ("story_%02d.mp3" % i)
         transcode(f, story)
         ep_story_aud.append(assets.add(story.read_bytes(), "mp3"))
         et = clean_title(f.stem)
-        ep_title_aud.append(None if args.no_episode_tts else
+        ep_title_aud.append(silent_aud if args.no_episode_tts else
                             assets.add(tts_mp3(et, work / ("t_%02d.mp3" % i)), "mp3"))
         print("  %02d  %s" % (i, et))
 
@@ -356,10 +388,12 @@ def build(args):
         a_t = action(f"title_{n}", [U(f"story_{n}")])
         stage(f"title_{n}", ep_img[i], ep_title_aud[i], controls(1, 1, 1, 0, 0),
               ok=tr(a_t, 0))
-        nxt = U(f"story_{n+1}") if n < len(files) else U(tkeys[0])
-        a_s = action(f"story_{n}", [nxt])
+        if n < len(files):
+            ok_next = tr(action(f"story_{n}", [U(f"story_{n+1}")]), 0)
+        else:
+            ok_next = tr(a_menu, 0)   # wrap through the menu, not a 1-option action
         stage(f"story_{n}", None, ep_story_aud[i], controls(0, 0, 1, 1, 1),
-              ok=tr(a_s, 0), home=tr(a_menu, i))
+              ok=ok_next, home=tr(a_menu, i))
 
     story = {"format": "v1", "version": 2, "title": title,
              "description": "%s — %d épisodes" % (title, len(files)),
