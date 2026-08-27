@@ -11,6 +11,30 @@
 # the end of the numbering.
 set -e
 
+script=$0
+case "$script" in
+    */*) ;;
+    *) script=$(command -v "$script") || exit 1 ;;
+esac
+case "$script" in
+    /*) ;;
+    *) script=$PWD/$script ;;
+esac
+while [ -L "$script" ]; do
+    link=$(readlink "$script") || exit 1
+    case "$link" in
+        /*) script=$link ;;
+        *) script=$(dirname "$script")/$link ;;
+    esac
+done
+script_dir=$(CDPATH= cd -P "$(dirname "$script")" 2>/dev/null && pwd) || {
+    echo "yt-dlp-podcast: could not resolve its script directory" >&2
+    exit 1
+}
+
+ytdlp=$script_dir/lunii-pack/venv/bin/yt-dlp
+[ -x "$ytdlp" ] || ytdlp=yt-dlp
+
 url=$1
 if [ -z "$url" ]; then
     echo "usage: yt-dlp-podcast RSS_URL [yt-dlp options]" >&2
@@ -19,7 +43,7 @@ fi
 shift
 
 # Album directory, sanitized exactly as yt-dlp would write it (%(...)S)
-dir=$(yt-dlp --flat-playlist -I1 --print '%(playlist_title)S' "$url" | head -n1)
+dir=$("$ytdlp" --flat-playlist -I1 --print '%(playlist_title)S' -- "$url" | head -n1)
 if [ -z "$dir" ]; then
     echo "yt-dlp-podcast: could not read playlist title from $url" >&2
     exit 1
@@ -29,14 +53,14 @@ fi
 esc=$(printf '%s' "$dir" | sed 's/%/%%/g')
 
 status=0
-yt-dlp -o "$esc/%(playlist_index)s_%(title)s.%(ext)s" \
+"$ytdlp" -o "$esc/%(playlist_index)s_%(title)s.%(ext)s" \
        --download-archive "$dir/.yt-dlp-archive" \
-       "$url" "$@" || status=$?
+       "$@" -- "$url" || status=$?
 if [ "$status" -ne 0 ]; then
     echo "yt-dlp-podcast: warning: yt-dlp exited $status; renumbering what was downloaded" >&2
 fi
 
-renumber=$(dirname -- "$(readlink -f -- "$0")")/podcast-renumber
+renumber=$script_dir/podcast-renumber
 [ -x "$renumber" ] || renumber=podcast-renumber
-"$renumber" --feed "$url" "$dir"
+"$renumber" --feed "$url" -- "$dir"
 exit "$status"

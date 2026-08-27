@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "spdx_file_copyright_text": "2026 Thomas Guillem",
+  "spdx_license_identifier": "MPL-2.0",
+  "voice": {
+    "id": "fr_FR-siwis-medium",
+    "repository": "https://huggingface.co/rhasspy/piper-voices",
+    "revision": "0c9c5d340496a47205a799eb046aab69334a88e9",
+    "repository_license": "MIT",
+    "dataset": {
+      "name": "SIWIS",
+      "license": "CC-BY-4.0",
+      "source": "https://datashare.ed.ac.uk/handle/10283/2353"
+    },
+    "files": [
+      {
+        "name": "fr_FR-siwis-medium.onnx",
+        "url": "https://huggingface.co/rhasspy/piper-voices/resolve/0c9c5d340496a47205a799eb046aab69334a88e9/fr/fr_FR/siwis/medium/fr_FR-siwis-medium.onnx",
+        "size": 63201294,
+        "sha256": "641d1ab097da2b81128c076810edb052b385decc8be3381814802a64a73baf99"
+      },
+      {
+        "name": "fr_FR-siwis-medium.onnx.json",
+        "url": "https://huggingface.co/rhasspy/piper-voices/resolve/0c9c5d340496a47205a799eb046aab69334a88e9/fr/fr_FR/siwis/medium/fr_FR-siwis-medium.onnx.json",
+        "size": 4875,
+        "sha256": "39479916c2db192b5ac9764daddd0c744d83e023ad890c6976c0633ae4df8959"
+      }
+    ]
+  }
+}

@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: 2026 Thomas Guillem
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+# SPDX-License-Identifier: MPL-2.0
+
+defusedxml==0.7.1
+mutagen==1.48.1
+Pillow==12.3.0
+piper-tts==1.7.0
+requests==2.34.2
+yt-dlp==2026.8.19

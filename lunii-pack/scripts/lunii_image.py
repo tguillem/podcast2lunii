@@ -18,19 +18,29 @@ def fit_cover(img, w=W, h=H, bg=(0, 0, 0)):
     src_w, src_h = img.size
     scale = max(w / src_w, h / src_h)
     nw, nh = round(src_w * scale), round(src_h * scale)
-    img = img.resize((nw, nh), Image.LANCZOS)
+    img = img.resize((nw, nh), Image.Resampling.LANCZOS)
     left = (nw - w) // 2
     top = (nh - h) // 2
     return img.crop((left, top, left + w, top + h))
 
 
 def _load_font(size, bold=True):
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold
-        else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
-        "/usr/share/fonts/truetype/lato/Lato-Bold.ttf",
-    ]
+    if bold:
+        candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+            "/usr/share/fonts/truetype/lato/Lato-Bold.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+            "/Library/Fonts/Arial Bold.ttf",
+        ]
+    else:
+        candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+            "/usr/share/fonts/truetype/lato/Lato-Regular.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/Library/Fonts/Arial.ttf",
+        ]
     for c in candidates:
         try:
             return ImageFont.truetype(c, size)
@@ -68,7 +78,11 @@ def quantize16(img):
     """Return (indices bytes row-major top-down, palette list of (r,g,b) len<=16)."""
     img = img.convert("RGB")
     # Adaptive 16-color palette, no dithering keeps runs long for RLE.
-    p = img.quantize(colors=16, method=Image.MEDIANCUT, dither=Image.NONE)
+    p = img.quantize(
+        colors=16,
+        method=Image.Quantize.MEDIANCUT,
+        dither=Image.Dither.NONE,
+    )
     pal_raw = p.getpalette()[:16 * 3]
     palette = [tuple(pal_raw[i:i + 3]) for i in range(0, len(pal_raw), 3)]
     while len(palette) < 16:

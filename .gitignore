@@ -2,7 +2,7 @@
 __pycache__/
 *.py[cod]
 
-# Virtualenv (recreate: python3 -m venv --system-site-packages lunii-pack/venv)
+# Virtualenv (recreate: python3 tools/bootstrap.py)
 lunii-pack/venv/
 
 # TTS voice models (large binaries, re-downloadable from HuggingFace)
@@ -30,3 +30,6 @@ lunii-pack/tasks/
 *.png
 *.jpg
 *.jpeg
+
+# macOS metadata
+.DS_Store

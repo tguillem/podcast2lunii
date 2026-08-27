@@ -2,5 +2,24 @@
 # install_pack — one-command wrapper: install a Lunii pack .zip onto a device.
 # usage: ./install_pack PACK.zip --mount /media/you/LUNII (--dry-run | --yes)
 # See scripts/install_pack.py for options.
-here=$(dirname -- "$(readlink -f -- "$0")")
+script=$0
+case "$script" in
+    */*) ;;
+    *) script=$(command -v "$script") || exit 1 ;;
+esac
+case "$script" in
+    /*) ;;
+    *) script=$PWD/$script ;;
+esac
+while [ -L "$script" ]; do
+    link=$(readlink "$script") || exit 1
+    case "$link" in
+        /*) script=$link ;;
+        *) script=$(dirname "$script")/$link ;;
+    esac
+done
+here=$(CDPATH= cd -P "$(dirname "$script")" 2>/dev/null && pwd) || {
+    echo "install_pack: could not resolve its script directory" >&2
+    exit 1
+}
 exec "$here/venv/bin/python" "$here/scripts/install_pack.py" "$@"

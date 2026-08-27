@@ -1,5 +1,25 @@
 #!/bin/sh
 # podcast2lunii — one-command wrapper: podcast folder -> Lunii pack .zip
 # See scripts/podcast2lunii.py for options.
-here=$(dirname -- "$(readlink -f -- "$0")")
+
+script=$0
+case "$script" in
+    */*) ;;
+    *) script=$(command -v "$script") || exit 1 ;;
+esac
+case "$script" in
+    /*) ;;
+    *) script=$PWD/$script ;;
+esac
+while [ -L "$script" ]; do
+    link=$(readlink "$script") || exit 1
+    case "$link" in
+        /*) script=$link ;;
+        *) script=$(dirname "$script")/$link ;;
+    esac
+done
+here=$(CDPATH= cd -P "$(dirname "$script")" 2>/dev/null && pwd) || {
+    echo "podcast2lunii: could not resolve its script directory" >&2
+    exit 1
+}
 exec "$here/venv/bin/python" "$here/scripts/podcast2lunii.py" "$@"
