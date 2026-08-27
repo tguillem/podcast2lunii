@@ -23,6 +23,7 @@ Assets are content-addressed: filename = sha1(bytes).ext, so identical assets
 import hashlib
 import io
 import json
+import re
 import subprocess
 import sys
 import uuid
@@ -40,6 +41,16 @@ MODEL = ROOT / "voices" / "fr_FR-siwis-medium.onnx"
 # fixed namespace -> deterministic UUIDs (re-running yields an identical pack)
 NS = uuid.UUID("1b671a64-40d5-491e-99b0-da01ff1f3341")
 AUDIO_LEAD_IN_MS = 500
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
+
+class PackBuildError(ValueError):
+    """Raised when pack input would produce an invalid archive graph."""
+
+
+def require(condition, message):
+    if not condition:
+        raise PackBuildError(message)
 
 
 def det_uuid(slug, key):
@@ -80,10 +91,14 @@ def controls(wheel, ok, home, pause, autoplay):
 
 
 def build(slug):
+    require(bool(SLUG_RE.fullmatch(slug)),
+            "slug must contain only lowercase letters, digits, '.', '_' or '-'"
+            " and must start with a letter or digit")
     show_dir = ROOT / "build" / slug
     meta = json.loads((show_dir / "titles.json").read_text())
     show_title = meta["show_title"]
     eps = meta["episodes"]
+    require(isinstance(eps, list) and eps, "titles.json must contain at least one episode")
     work = show_dir / "work"
     work.mkdir(exist_ok=True)
     assets = AssetBag()
@@ -198,28 +213,36 @@ def validate(story, assets):
     names = {nm for nm, _ in assets.items.values()}
     stages = {s["uuid"]: s for s in story["stageNodes"]}
     actions = {a["uuid"]: a for a in story["actionNodes"]}
-    assert story["stageNodes"], "no stage nodes"
+    require(bool(story["stageNodes"]), "no stage nodes")
     squares = [s for s in story["stageNodes"] if s.get("squareOne")]
-    assert len(squares) == 1, f"expected exactly 1 squareOne node, got {len(squares)}"
+    require(len(squares) == 1,
+            f"expected exactly 1 squareOne node, got {len(squares)}")
     for a in story["actionNodes"]:
-        assert "id" in a, "action node missing 'id' (reader keys on id)"
+        require("id" in a, "action node missing 'id' (reader keys on id)")
+        require(bool(a["options"]), f"{a.get('name', 'action')}: no options")
         for opt in a["options"]:
-            assert opt in stages, f"action option -> unknown stage {opt}"
+            require(opt in stages, f"action option -> unknown stage {opt}")
     for s in story["stageNodes"]:
         cs = s["controlSettings"]
         for k in ("wheel", "ok", "home", "pause", "autoplay"):
-            assert k in cs, f"{s['name']}: controlSettings missing {k}"
+            require(k in cs, f"{s['name']}: controlSettings missing {k}")
         for img in (s["image"],):
-            assert img is None or img in names, f"{s['name']}: image asset {img} missing"
-        assert s["audio"] is None or s["audio"] in names, f"{s['name']}: audio missing"
+            require(img is None or img in names,
+                    f"{s['name']}: image asset {img} missing")
+        require(s["audio"] is None or s["audio"] in names,
+                f"{s['name']}: audio missing")
         for t in (s["okTransition"], s["homeTransition"]):
             if t is not None:
                 a = actions.get(t["actionNode"])
-                assert a is not None, f"{s['name']}: transition to unknown action"
-                assert 0 <= t["optionIndex"] < len(a["options"]), \
-                    f"{s['name']}: optionIndex {t['optionIndex']} out of range"
+                require(a is not None,
+                        f"{s['name']}: transition to unknown action")
+                require(0 <= t["optionIndex"] < len(a["options"]),
+                        f"{s['name']}: optionIndex {t['optionIndex']} out of range")
     print("  validation: OK")
 
 
 if __name__ == "__main__":
-    build(sys.argv[1] if len(sys.argv) > 1 else "example-show")
+    try:
+        build(sys.argv[1] if len(sys.argv) > 1 else "example-show")
+    except PackBuildError as exc:
+        raise SystemExit(f"error: {exc}") from exc

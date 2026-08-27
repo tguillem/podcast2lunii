@@ -16,6 +16,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 import zipfile
@@ -31,6 +32,15 @@ COMMON_KEY = bytes(
 )
 CLEAR_FILES = {"ni", "nm", ".cleartext"}
 NO_COPY_FILES = {".cleartext"}
+
+# A 1 GiB asset budget accommodates large multi-episode podcast packs while
+# placing a hard bound on this in-memory converter. Individual assets may be
+# up to 256 MiB, and graph metadata may be up to 16 MiB.
+MAX_ARCHIVE_MEMBERS = 8192
+MAX_STORY_BYTES = 16 * 1024 * 1024
+MAX_ASSET_BYTES = 256 * 1024 * 1024
+MAX_TOTAL_ASSET_BYTES = 1024 * 1024 * 1024
+MAX_ASSET_NAME_BYTES = 255
 
 
 class PackError(RuntimeError):
@@ -90,20 +100,85 @@ def read_archive(path: Path) -> ArchivePack:
 
     try:
         with zipfile.ZipFile(path) as zf:
-            try:
-                story = json.loads(zf.read("story.json").decode("utf-8"))
-            except KeyError:
+            members = zf.infolist()
+            if len(members) > MAX_ARCHIVE_MEMBERS:
+                fail(
+                    f"archive has {len(members)} members; maximum is "
+                    f"{MAX_ARCHIVE_MEMBERS}"
+                )
+
+            seen_names: set[str] = set()
+            story_info: zipfile.ZipInfo | None = None
+            asset_infos: dict[str, zipfile.ZipInfo] = {}
+            total_asset_bytes = 0
+            for info in members:
+                name = info.filename
+                if name in seen_names:
+                    fail(f"duplicate archive member: {name}")
+                seen_names.add(name)
+                if not name or "\x00" in name or "\\" in name or name.startswith("/"):
+                    fail(f"unsafe archive member name: {name!r}")
+                parts = name.rstrip("/").split("/")
+                if any(part in ("", ".", "..") for part in parts):
+                    fail(f"unsafe archive member name: {name!r}")
+                if info.flag_bits & 0x1:
+                    fail(f"encrypted archive members are unsupported: {name}")
+
+                if name == "story.json":
+                    if info.is_dir():
+                        fail("story.json must be a file")
+                    if info.file_size > MAX_STORY_BYTES:
+                        fail(
+                            f"story.json is {info.file_size} bytes; maximum is "
+                            f"{MAX_STORY_BYTES}"
+                        )
+                    story_info = info
+                    continue
+
+                if not name.startswith("assets/"):
+                    continue
+                if name == "assets/" and info.is_dir():
+                    continue
+                base = name[len("assets/"):]
+                if (
+                    info.is_dir()
+                    or not base
+                    or "/" in base
+                    or "\\" in base
+                    or base in (".", "..")
+                    or len(base.encode("utf-8")) > MAX_ASSET_NAME_BYTES
+                ):
+                    fail(f"asset names must be flat, safe filenames: {name!r}")
+                if base in asset_infos:
+                    fail(f"duplicate asset name in archive: {base}")
+                if info.file_size > MAX_ASSET_BYTES:
+                    fail(
+                        f"asset {base} is {info.file_size} bytes; maximum is "
+                        f"{MAX_ASSET_BYTES}"
+                    )
+                total_asset_bytes += info.file_size
+                if total_asset_bytes > MAX_TOTAL_ASSET_BYTES:
+                    fail(
+                        f"archive assets total more than {MAX_TOTAL_ASSET_BYTES} bytes"
+                    )
+                asset_infos[base] = info
+
+            if story_info is None:
                 fail("archive is missing story.json")
-            assets: dict[str, bytes] = {}
-            for name in zf.namelist():
-                if name.startswith("assets/") and not name.endswith("/"):
-                    base = Path(name).name
-                    if not base:
-                        continue
-                    if base in assets:
-                        fail(f"duplicate asset basename in archive: {base}")
-                    assets[base] = zf.read(name)
-    except zipfile.BadZipFile as exc:
+            try:
+                story = json.loads(zf.read(story_info).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+                fail(f"story.json is not valid UTF-8 JSON: {exc}")
+            assets = {base: zf.read(info) for base, info in asset_infos.items()}
+    except PackError:
+        raise
+    except (
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+        OSError,
+        RuntimeError,
+        NotImplementedError,
+    ) as exc:
         fail(f"not a valid zip archive: {path}: {exc}")
 
     validate_archive(story, assets)
@@ -133,6 +208,8 @@ def validate_archive(story: dict[str, Any], assets: dict[str, bytes]) -> None:
         fail("story.json root must be an object")
     if story.get("format") not in (None, "v1"):
         fail(f"unsupported story format: {story.get('format')!r}")
+    if type(story.get("version", 0)) is not int:
+        fail("story version must be an integer")
     try:
         uuid.UUID(str(story["uuid"]))
     except Exception as exc:
@@ -162,6 +239,10 @@ def validate_archive(story: dict[str, Any], assets: dict[str, bytes]) -> None:
         if not isinstance(options, list):
             fail(f"action {node_key(action)} options must be a list")
         for option in options:
+            if not isinstance(option, str) or not option:
+                fail(
+                    f"action {node_key(action)} option must be a non-empty string"
+                )
             if option not in stage_by_key:
                 fail(f"action {node_key(action)} option points to unknown stage {option!r}")
         for key in node_keys(action):
@@ -185,10 +266,14 @@ def validate_archive(story: dict[str, Any], assets: dict[str, bytes]) -> None:
         image = stage.get("image")
         audio = stage.get("audio")
         if image is not None:
+            if not isinstance(image, str) or not image:
+                fail(f"{stage_name}: image asset reference must be a non-empty string or null")
             if image not in assets:
                 fail(f"{stage_name}: referenced image asset is missing: {image}")
             validate_bmp(assets[image], f"{stage_name}: {image}")
         if audio is not None:
+            if not isinstance(audio, str) or not audio:
+                fail(f"{stage_name}: audio asset reference must be a non-empty string or null")
             if audio not in assets:
                 fail(f"{stage_name}: referenced audio asset is missing: {audio}")
             validate_mp3(assets[audio], f"{stage_name}: {audio}")
@@ -200,11 +285,15 @@ def validate_archive(story: dict[str, Any], assets: dict[str, bytes]) -> None:
             if not isinstance(transition, dict):
                 fail(f"{stage_name}: {transition_name} must be an object or null")
             action_key = transition.get("actionNode")
+            if not isinstance(action_key, str) or not action_key:
+                fail(
+                    f"{stage_name}: {transition_name}.actionNode must be a non-empty string"
+                )
             action = action_by_key.get(action_key)
             if action is None:
                 fail(f"{stage_name}: {transition_name} points to unknown action {action_key!r}")
             option_index = transition.get("optionIndex")
-            if not isinstance(option_index, int):
+            if type(option_index) is not int:
                 fail(f"{stage_name}: {transition_name}.optionIndex must be an integer")
             if not 0 <= option_index < len(action["options"]):
                 fail(
@@ -451,18 +540,83 @@ def read_pack_index(pi: Path) -> list[uuid.UUID]:
     return [uuid.UUID(bytes=data[i:i + 16]) for i in range(0, len(data), 16)]
 
 
-def write_pack_index_atomic(pi: Path, entries: list[uuid.UUID]) -> Path:
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    backup = pi.with_name(f".pi.bak.{stamp}")
-    shutil.copy2(pi, backup)
+def copy_exclusive(source: Path, destination: Path) -> None:
+    """Copy ``source`` without ever replacing an existing destination."""
+    descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with source.open("rb") as input_file, os.fdopen(descriptor, "wb") as output_file:
+            descriptor = -1
+            shutil.copyfileobj(input_file, output_file)
+            output_file.flush()
+            os.fsync(output_file.fileno())
+        shutil.copystat(source, destination)
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        destination.unlink(missing_ok=True)
+        raise
 
-    tmp = pi.with_name(".pi.tmp")
-    with tmp.open("wb") as fh:
-        for entry in entries:
-            fh.write(entry.bytes)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, pi)
+
+def unique_pi_backup(pi: Path) -> Path:
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for counter in range(1000):
+        backup = pi.with_name(f".pi.bak.{stamp}.{os.getpid()}.{counter}")
+        try:
+            copy_exclusive(pi, backup)
+            return backup
+        except FileExistsError:
+            continue
+    fail(f"cannot allocate a unique .pi backup name next to {pi}")
+
+
+def replace_from_copy(source: Path, destination: Path) -> None:
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{destination.name}.restore.",
+            dir=destination.parent,
+            delete=False,
+        ) as output_file, source.open("rb") as input_file:
+            temporary = Path(output_file.name)
+            shutil.copyfileobj(input_file, output_file)
+            output_file.flush()
+            os.fsync(output_file.fileno())
+        os.replace(temporary, destination)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def write_pack_index_atomic(pi: Path, entries: list[uuid.UUID]) -> Path:
+    backup = unique_pi_backup(pi)
+
+    tmp: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=".pi.tmp.",
+            dir=pi.parent,
+            delete=False,
+        ) as fh:
+            tmp = Path(fh.name)
+            for entry in entries:
+                fh.write(entry.bytes)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, pi)
+    except BaseException as original:
+        try:
+            replace_from_copy(backup, pi)
+        except BaseException as recovery:
+            raise PackError(
+                f"failed to update {pi} and could not restore its backup "
+                f"{backup}: {recovery}"
+            ) from original
+        raise
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
     return backup
 
 
@@ -618,22 +772,77 @@ def plan_index(entries: list[uuid.UUID], pack_uuid: uuid.UUID, replace: bool) ->
 def install(summary: FsBuildSummary, mount: Path, device: DeviceInfo, entries: list[uuid.UUID], replace: bool) -> Path:
     content = mount / ".content"
     target = content / summary.pack8
-    tmp = content / f".{summary.pack8}.tmp.{os.getpid()}.{int(time.time())}"
-    if tmp.exists():
-        shutil.rmtree(tmp)
+    tmp = Path(tempfile.mkdtemp(prefix=f".{summary.pack8}.tmp.", dir=content))
+    previous: Path | None = None
+    installed_new_target = False
+    committed = False
+    backup: Path | None = None
+    try:
+        copy_pack_payload(summary.work_dir, tmp, cipher_v2=True)
+        add_boot_file_v2(tmp, device.uuid_block)
+        if target.exists():
+            if not replace:
+                fail(f"target pack folder already exists; pass --replace to replace it: {target}")
+            previous = target.with_name(
+                f".{summary.pack8}.previous.{uuid.uuid4().hex}"
+            )
+            if previous.exists():
+                fail(f"refusing to overwrite recovery folder: {previous}")
+            target.rename(previous)
 
-    copy_pack_payload(summary.work_dir, tmp, cipher_v2=True)
-    add_boot_file_v2(tmp, device.uuid_block)
-    if target.exists():
-        if not replace:
-            shutil.rmtree(tmp)
-            fail(f"target pack folder already exists; pass --replace to replace it: {target}")
-        shutil.rmtree(target)
-    os.rename(tmp, target)
+        try:
+            tmp.rename(target)
+            installed_new_target = True
+            new_entries, _ = plan_index(entries, summary.pack_uuid, replace)
+            backup = write_pack_index_atomic(mount / ".pi", new_entries)
+            committed = True
+        except BaseException as original:
+            recovery_errors: list[str] = []
+            if installed_new_target and target.exists():
+                try:
+                    shutil.rmtree(target)
+                except OSError as exc:
+                    recovery_errors.append(f"could not remove new target {target}: {exc}")
+            if previous is not None and previous.exists():
+                try:
+                    previous.rename(target)
+                except OSError as exc:
+                    recovery_errors.append(f"could not restore previous target {previous}: {exc}")
+            if recovery_errors:
+                raise PackError(
+                    "install failed and automatic content recovery was incomplete: "
+                    + "; ".join(recovery_errors)
+                ) from original
+            raise
+    except OSError as exc:
+        fail(f"device install failed: {exc}")
+    finally:
+        if tmp.exists():
+            shutil.rmtree(tmp, ignore_errors=True)
 
-    new_entries, _ = plan_index(entries, summary.pack_uuid, replace)
-    backup = write_pack_index_atomic(mount / ".pi", new_entries)
-    subprocess.run(["sync"], check=False)
+    if not committed or backup is None:
+        fail("device install did not reach its commit point")
+    if previous is not None and previous.exists():
+        try:
+            shutil.rmtree(previous)
+        except OSError as exc:
+            print(
+                f"warning: installed successfully but could not remove previous payload {previous}: {exc}",
+                file=sys.stderr,
+            )
+    try:
+        sync_result = subprocess.run(["sync"], check=False)
+    except OSError as exc:
+        print(
+            f"warning: install committed but could not run sync: {exc}",
+            file=sys.stderr,
+        )
+    else:
+        if sync_result.returncode != 0:
+            print(
+                f"warning: install committed but sync exited {sync_result.returncode}",
+                file=sys.stderr,
+            )
     return backup
 
 

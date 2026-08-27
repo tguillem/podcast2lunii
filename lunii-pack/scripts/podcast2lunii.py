@@ -28,11 +28,13 @@ import subprocess
 import sys
 import unicodedata
 import uuid
+import warnings
 import zipfile
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import requests
+from defusedxml import ElementTree as ET
+from defusedxml.common import DefusedXmlException
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -49,6 +51,57 @@ ITUNES_IMAGE = "{http://www.itunes.com/dtds/podcast-1.0.dtd}image"
 AUDIO_EXTS = {".mp3", ".m4a", ".m4b", ".ogg", ".oga", ".opus", ".flac"}
 PREFIX_RE = re.compile(r"^\d+_")
 AUDIO_LEAD_IN_MS = 500
+MAX_FEED_BYTES = 16 * 1024 * 1024
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
+
+class PackBuildError(ValueError):
+    """Raised when local input would produce an invalid archive graph."""
+
+
+def require(condition, message):
+    if not condition:
+        raise PackBuildError(message)
+
+
+def fetch_bytes(url, *, limit, params=None):
+    """Fetch an HTTP resource without buffering more than ``limit`` bytes."""
+    with requests.get(
+        url, params=params, timeout=(10, 40), stream=True,
+        headers={"User-Agent": "lunii-podcast-tools/1.0"},
+    ) as response:
+        response.raise_for_status()
+        length = response.headers.get("Content-Length")
+        try:
+            declared_length = int(length) if length is not None else None
+        except ValueError:
+            declared_length = None
+        if declared_length is not None and declared_length > limit:
+            raise ValueError(
+                "response from %s is too large (%d bytes; limit %d)"
+                % (response.url, declared_length, limit)
+            )
+        data = bytearray()
+        for chunk in response.iter_content(64 * 1024):
+            data.extend(chunk)
+            if len(data) > limit:
+                raise ValueError(
+                    "response from %s exceeds %d bytes" % (response.url, limit)
+                )
+        return bytes(data)
+
+
+def decode_image(data, source):
+    """Decode an image while treating Pillow decompression-bomb warnings as errors."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            image = Image.open(io.BytesIO(data))
+            image.load()
+            return image
+    except (OSError, Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+        raise ValueError("cover is not a safe readable image from %s: %s" % (source, exc)) from exc
 
 
 # ---------------------------------------------------------------- helpers
@@ -88,7 +141,12 @@ def download_feed(url, download_dir, extra):
     name = (name[0].strip() if name else "")
     if not name:
         sys.exit("could not read playlist title from %s" % url)
-    folder = download_dir / name
+    download_root = download_dir.resolve()
+    folder = (download_root / name).resolve()
+    try:
+        folder.relative_to(download_root)
+    except ValueError:
+        sys.exit("refusing playlist title that escapes the download directory: %r" % name)
     if has_audio_files(folder) and not os.access(download_dir, os.W_OK):
         print("download dir is read-only; using existing folder: %s" % folder)
         return folder
@@ -135,10 +193,14 @@ def tts_mp3(text, out):
 def rss_cover_url(feed_url):
     """Best-effort artwork URL from an RSS feed."""
     try:
-        r = requests.get(feed_url, timeout=30)
-        r.raise_for_status()
-        root = ET.fromstring(r.content)
-    except (requests.RequestException, ET.ParseError) as e:
+        root = ET.fromstring(fetch_bytes(feed_url, limit=MAX_FEED_BYTES))
+    except (
+        requests.RequestException,
+        ET.ParseError,
+        DefusedXmlException,
+        RecursionError,
+        ValueError,
+    ) as e:
         print("  cover: RSS artwork unavailable: %s" % e, file=sys.stderr)
         return None
 
@@ -167,9 +229,18 @@ def rss_cover_url(feed_url):
 def resolve_cover(args, title, dest):
     """Return cover art from RSS or an explicitly supplied path or URL."""
     if args.cover_file:
-        img = Image.open(args.cover_file)
-        img.load()
-        return img
+        cover_path = Path(args.cover_file)
+        if not cover_path.is_file():
+            sys.exit("Cover file not found: %s" % cover_path)
+        if cover_path.stat().st_size > MAX_IMAGE_BYTES:
+            sys.exit(
+                "Cover file is too large (%d bytes; limit %d): %s"
+                % (cover_path.stat().st_size, MAX_IMAGE_BYTES, cover_path)
+            )
+        try:
+            return decode_image(cover_path.read_bytes(), cover_path)
+        except ValueError as e:
+            sys.exit(str(e))
     url = args.cover_url
     if url is None and str(args.src).startswith(("http://", "https://")):
         url = rss_cover_url(args.src)
@@ -183,18 +254,12 @@ def resolve_cover(args, title, dest):
         )
 
     try:
-        r = requests.get(url, timeout=40)
-        r.raise_for_status()
-    except requests.RequestException as e:
+        data = fetch_bytes(url, limit=MAX_IMAGE_BYTES)
+        img = decode_image(data, url)
+    except (requests.RequestException, ValueError) as e:
         sys.exit("Cover download failed for %s: %s" % (url, e))
-    data = r.content
     dest.write_bytes(data)
-    try:
-        img = Image.open(io.BytesIO(data))
-        img.load()
-        return img
-    except OSError as e:
-        sys.exit("Cover is not a readable image from %s: %s" % (url, e))
+    return img
 
 
 # ---------------------------------------------------------------- assets/graph
@@ -217,8 +282,12 @@ def build(args):
         src = download_feed(args.src, args.download_dir, args.dl_extra)
     else:
         src = Path(args.src)
+    require(src.is_dir(), "source is not a directory: %s" % src)
     title = args.title or src.name
     slug = args.slug or slugify(title)
+    require(bool(SLUG_RE.fullmatch(slug)),
+            "slug must contain only lowercase letters, digits, '.', '_' or '-'"
+            " and must start with a letter or digit")
     outdir = Path(args.outdir or (ROOT / "build" / slug))
     work = outdir / "work"
     work.mkdir(parents=True, exist_ok=True)
@@ -312,20 +381,27 @@ def validate(story, assets):
     names = {nm for nm, _ in assets.items.values()}
     stages = {s["uuid"]: s for s in story["stageNodes"]}
     actions = {a["uuid"]: a for a in story["actionNodes"]}
-    assert sum(bool(s.get("squareOne")) for s in story["stageNodes"]) == 1
+    require(sum(bool(s.get("squareOne")) for s in story["stageNodes"]) == 1,
+            "archive graph must contain exactly one squareOne stage")
     for a in story["actionNodes"]:
-        assert "id" in a and a["options"]
+        require("id" in a and bool(a["options"]),
+                f"{a.get('name', 'action')}: missing id or options")
         for o in a["options"]:
-            assert o in stages, "dangling option"
+            require(o in stages, f"{a.get('name', 'action')}: dangling option {o}")
     for s in story["stageNodes"]:
         for k in ("wheel", "ok", "home", "pause", "autoplay"):
-            assert k in s["controlSettings"], f"{s['name']} missing {k}"
-        assert s["image"] in (None, *names), f"{s['name']} image missing"
-        assert s["audio"] in (None, *names), f"{s['name']} audio missing"
+            require(k in s["controlSettings"], f"{s['name']} missing {k}")
+        require(s["image"] is None or s["image"] in names,
+                f"{s['name']} image missing")
+        require(s["audio"] is None or s["audio"] in names,
+                f"{s['name']} audio missing")
         for t in (s["okTransition"], s["homeTransition"]):
             if t:
+                require(t["actionNode"] in actions,
+                        f"{s['name']}: transition points to unknown action")
                 a = actions[t["actionNode"]]
-                assert 0 <= t["optionIndex"] < len(a["options"])
+                require(0 <= t["optionIndex"] < len(a["options"]),
+                        f"{s['name']}: transition option index is out of range")
 
 
 def main():
@@ -346,7 +422,11 @@ def main():
     g.add_argument("--cover-file")
     ap.add_argument("--menu-prompt", default="Choisis une histoire")
     ap.add_argument("--no-episode-tts", action="store_true")
-    build(ap.parse_args())
+    args = ap.parse_args()
+    try:
+        build(args)
+    except PackBuildError as exc:
+        ap.error(str(exc))
 
 
 if __name__ == "__main__":
