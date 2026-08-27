@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Thomas Guillem
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+# SPDX-License-Identifier: MPL-2.0
+# Portions adapted from STUdio 0.4.0; see NOTICE.md.
 """Install a generated STUdio/Lunii archive directly onto a mounted device.
 
 This converts the archive ``story.json`` graph into the filesystem pack format

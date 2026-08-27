@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Thomas Guillem
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+# SPDX-License-Identifier: MPL-2.0
 """Prepare a downloaded podcast dir for packing:
  - glob audio files (NN_ prefix = play order from podcast-renumber)
  - transcode each to 44.1kHz mono 64kbps MP3 (matches reference packs)

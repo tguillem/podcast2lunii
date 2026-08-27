@@ -1,3 +1,8 @@
+# SPDX-FileCopyrightText: 2026 Thomas Guillem
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+# SPDX-License-Identifier: MPL-2.0
 """Generate 320x240 4-bit (16-color) BMPs for the Lunii/STUdio pack format.
 
 The device screen is low quality; assets in reference packs are 320x240,
