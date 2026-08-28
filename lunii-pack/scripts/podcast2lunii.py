@@ -192,6 +192,11 @@ def require_voice():
 
 
 def tts_mp3(text, out):
+    text = (text or "").strip()
+    if not text:
+        # clean_title can legitimately reduce a title to nothing ("01_" or
+        # "01_Le debat :"); piper exits 1 on empty input.
+        return silent_mp3(out)
     wav = out.with_suffix(".wav")
     result = subprocess.run([str(PIPER), "-m", str(MODEL), "-f", str(wav)],
                             input=text.encode("utf-8"), capture_output=True)
@@ -312,12 +317,12 @@ def controls(w, o, h, p, a):
 
 
 def build(args):
+    require_voice()          # before any downloading or transcoding
     if str(args.src).startswith(("http://", "https://")):
         src = download_feed(args.src, args.download_dir, args.dl_extra)
     else:
         src = Path(args.src)
     require(src.is_dir(), "source is not a directory: %s" % src)
-    require_voice()
     title = args.title or src.name
     slug = args.slug or slugify(title)
     require(bool(SLUG_RE.fullmatch(slug)),

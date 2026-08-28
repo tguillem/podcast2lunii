@@ -567,5 +567,162 @@ class RssOnlyOrderTests(unittest.TestCase):
         )
 
 
+class EmbeddedArcTests(unittest.TestCase):
+    """A numbered arc inside an anthology must play in part order.
+
+    A feed can be 100 standalone episodes with a 16-part arc among them. The
+    arc is far too small a minority for the whole-feed series test, so it was
+    left in whatever order the feed happened to give.
+    """
+
+    def order(self, titles, days=None):
+        """days: publication day per item; defaults to newest-first."""
+        directory = Path(tempfile.mkdtemp(prefix="arc-"))
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        days = days or [28 - i for i in range(len(titles))]
+        items = "".join(
+            "<item><title>%s</title><guid>g%d</guid>"
+            "<pubDate>Mon, %02d Mar 2025 06:00:00 GMT</pubDate></item>"
+            % (t, i, d) for i, (t, d) in enumerate(zip(titles, days)))
+        path = directory / "feed.xml"
+        path.write_text(
+            '<?xml version="1.0"?><rss version="2.0"><channel><title>S</title>'
+            "%s</channel></rss>" % items)
+        _, parsed = renumber.load_feed(str(path))
+        return [it["title"] for it in sorted(parsed, key=lambda i: i["seq"])]
+
+    def test_arc_is_ordered_without_moving_the_standalone_episodes(self):
+        feed = ["Solo1", "Arc 2/3", "Solo2", "Arc 3/3", "Solo3", "Arc 1/3",
+                "Solo4", "Solo5"]
+        self.assertEqual(
+            self.order(feed),
+            ["Solo5", "Solo4", "Arc 1/3", "Solo3", "Arc 2/3", "Solo2",
+             "Arc 3/3", "Solo1"],
+            "the arc must ascend in the slots it already occupies, and the "
+            "standalone episodes must not move")
+
+    def test_dates_are_not_treated_as_an_arc(self):
+        """Day/month pairs must not be reordered as if they were parts."""
+        feed = ["Bulletin du 03/03", "Solo", "Bulletin du 02/03",
+                "Bulletin du 01/03"]
+        # pubDates match the dates in the titles, as a real feed's do.
+        self.assertEqual(self.order(feed, days=[3, 4, 2, 1]),
+                         ["Bulletin du 01/03", "Bulletin du 02/03",
+                          "Solo", "Bulletin du 03/03"])
+
+    def test_arc_with_a_repeated_part_number_is_left_alone(self):
+        feed = ["A 1/3", "B 1/3", "Solo", "A 2/3"]
+        self.assertEqual(self.order(feed), ["A 2/3", "Solo", "B 1/3", "A 1/3"])
+
+
+class ArcGuardTests(unittest.TestCase):
+    """Isolate each guard in the arc pass.
+
+    Written after mutation testing: the earlier fixtures were caught by
+    whichever guard was left, so removing either one alone still passed.
+    """
+
+    def order(self, entries):
+        """entries: [(title, day)] in feed order."""
+        directory = Path(tempfile.mkdtemp(prefix="guard-"))
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        items = "".join(
+            "<item><title>%s</title><guid>g%d</guid>"
+            "<pubDate>Mon, %02d Dec 2025 06:00:00 GMT</pubDate></item>"
+            % (title, i, day) for i, (title, day) in enumerate(entries))
+        path = directory / "feed.xml"
+        path.write_text(
+            '<?xml version="1.0"?><rss version="2.0"><channel><title>S</title>'
+            "%s</channel></rss>" % items)
+        _, parsed = renumber.load_feed(str(path))
+        return [it["title"] for it in sorted(parsed, key=lambda i: i["seq"])]
+
+    def test_dated_items_keep_the_reversed_rss_order(self):
+        """Only the date guard can catch this: the parts are inside 1..M.
+
+        Days 1..6 of month 12 look exactly like parts 1..6 of 6, so without
+        the pubDate check the arc pass would 'sort' them and override the
+        reversed-RSS fallback.
+        """
+        entries = [("Journal - %02d/12" % k, k) for k in range(1, 7)]
+        self.assertEqual(self.order(entries),
+                         ["Journal - %02d/12" % k for k in range(6, 0, -1)],
+                         "day/month pairs must not be reordered as parts")
+
+    def test_out_of_range_numbers_are_left_alone(self):
+        """Only the 1..M range guard can catch this: the dates do not match.
+
+        'Ep 7/3' is not part 7 of 3. The publication days deliberately differ
+        from the numerators, so the date guard cannot fire here.
+        """
+        entries = [("Ep 7/3", 20), ("Ep 9/3", 21),
+                   ("Ep 5/3", 22), ("Solo", 23)]
+        # Falls back to the feed reversed, untouched by the arc pass.
+        self.assertEqual(self.order(entries),
+                         ["Solo", "Ep 5/3", "Ep 9/3", "Ep 7/3"])
+
+
+class RobustnessTests(unittest.TestCase):
+    """Malformed input must produce a message, not a traceback."""
+
+    def feed_with(self, item_xml):
+        directory = Path(tempfile.mkdtemp(prefix="robust-"))
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        path = directory / "feed.xml"
+        path.write_text(
+            '<?xml version="1.0"?><rss version="2.0"><channel><title>S</title>'
+            "%s</channel></rss>" % item_xml)
+        return path
+
+    def test_malformed_pubdate_does_not_abort(self):
+        path = self.feed_with(
+            "<item><title>A</title><guid>a</guid>"
+            "<pubDate>not a date at all</pubDate></item>"
+            "<item><title>B</title><guid>b</guid>"
+            "<pubDate>Mon, 03 Mar 2025 06:00:00 GMT</pubDate></item>")
+        _, items = renumber.load_feed(str(path))
+        self.assertEqual(len(items), 2)
+        self.assertIsNone([i for i in items if i["title"] == "A"][0]["pub"])
+
+    @unittest.skipUnless(HAVE_FFMPEG, "ffmpeg is required to synthesize test audio")
+    def test_directory_named_like_audio_is_ignored(self):
+        directory = Path(tempfile.mkdtemp(prefix="robust-dir-"))
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        audio = directory / "audio"
+        write_audio(audio, ["Real"])
+        (audio / "bonus.mp3").mkdir()          # a directory, not a file
+        feed = write_feed(directory, ["Real"])
+        run_renumber(feed, audio)              # must not raise
+        self.assertTrue((audio / "01_Real.mp3").is_file())
+        self.assertTrue((audio / "bonus.mp3").is_dir())
+
+    def test_missing_voice_fails_before_downloading(self):
+        """A URL run used to download the whole feed, then fail on the voice."""
+        import types
+        p2l = load(SCRIPTS / "podcast2lunii.py", "p2l_voice_test")
+        downloaded = []
+        p2l.download_feed = lambda *a, **k: downloaded.append(1) or Path(".")
+        p2l.PIPER = Path("/nonexistent/piper")
+        p2l.MODEL = Path("/nonexistent/voice.onnx")
+        args = types.SimpleNamespace(
+            src="https://example.invalid/feed.xml", download_dir=".", dl_extra=[],
+            title=None, slug=None, outdir=None, cover_url=None,
+            cover_file=None, menu_prompt="x", no_episode_tts=False)
+        with self.assertRaises(SystemExit):
+            p2l.build(args)
+        self.assertEqual(downloaded, [],
+                         "must fail on the missing voice before downloading")
+
+    @unittest.skipUnless(HAVE_FFMPEG, "ffmpeg is required to synthesize test audio")
+    def test_empty_title_yields_silence_not_a_crash(self):
+        """clean_title can reduce a title to nothing; piper exits 1 on empty."""
+        p2l = load(SCRIPTS / "podcast2lunii.py", "p2l_under_test")
+        self.assertEqual(p2l.clean_title("01_"), "")
+        with tempfile.TemporaryDirectory() as tmp:
+            data = p2l.tts_mp3("", Path(tmp) / "t.mp3")
+            self.assertTrue(data)
+            install_pack.validate_mp3(data, "empty-title placeholder")
+
+
 if __name__ == "__main__":
     unittest.main()

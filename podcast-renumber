@@ -62,6 +62,16 @@ def read_capped(response, limit, source):
     return data
 
 
+def parse_pubdate(value):
+    """A malformed <pubDate> must not abort the run; ordering falls back."""
+    if not value:
+        return None
+    try:
+        return parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def norm(s):
     """Normalize a title for matching: fold the chars yt-dlp filename
     sanitization substitutes (： ＂ ⧸ …), unify quotes, collapse spaces."""
@@ -97,7 +107,7 @@ def load_feed(src):
             "title": title,
             "norm": norm(title),
             "enc": (enc.get("url") or "").strip() if enc is not None else "",
-            "pub": parsedate_to_datetime(pubdate) if pubdate else None,
+            "pub": parse_pubdate(pubdate),
         })
 
     # Episode order, highest priority first:
@@ -121,6 +131,7 @@ def load_feed(src):
         ranks = range(len(items) - 1, -1, -1)
     for seq, i in enumerate(ranks):
         items[i]["seq"] = seq
+    order_embedded_arcs(items)
 
     return (channel.findtext("title") or "").strip(), items
 
@@ -174,6 +185,40 @@ def is_part_series(items, marks, dominant):
     # all. A misread date feed's leftovers are simply other months.
     return not any(m is None and EPNUM_RE.search(items[i]["norm"])
                    for i, m in enumerate(marks))
+
+
+def order_embedded_arcs(items):
+    """Put each numbered arc into part order, in the slots it already holds.
+
+    A feed can be an anthology with an arc inside it -- a hundred standalone
+    episodes around a 16-part one, say -- far too small a minority for the
+    whole-feed series test. Reordering only within the positions the arc
+    already occupies leaves every other episode where the RSS placed it.
+    """
+    groups = {}
+    for i, item in enumerate(items):
+        if item.get("extra"):
+            continue
+        for match in EPNUM_RE.finditer(item["norm"]):
+            groups.setdefault(match.group(2), {}).setdefault(i, match)
+    for denominator, members in groups.items():
+        total = int(denominator)
+        parts = [int(match.group(1)) for match in members.values()]
+        if total < 2 or len(members) < 2:
+            continue
+        if len(set(parts)) != len(parts):
+            continue                       # ambiguous: two arcs share a shape
+        if any(part < 1 or part > total for part in parts):
+            continue                       # not part numbers at all
+        marks = [None] * len(items)
+        for i, match in members.items():
+            marks[i] = match
+        if looks_like_dates(items, marks):
+            continue
+        slots = sorted(items[i]["seq"] for i in members)
+        for slot, i in zip(slots, sorted(members,
+                                         key=lambda i: int(members[i].group(1)))):
+            items[i]["seq"] = slot
 
 
 def title_candidates(path, tags):
@@ -301,7 +346,7 @@ def main():
     album = None if args.keep_album else (args.album or chan_title or None)
 
     files = sorted(p for p in args.dir.iterdir()
-                   if p.suffix.lower() in AUDIO_EXTS)
+                   if p.is_file() and p.suffix.lower() in AUDIO_EXTS)
     # Checked before the empty-directory exit: staging names carry no audio
     # suffix, so a run interrupted after staging everything looks like an empty
     # directory and would otherwise report that instead of the recoverable files.
@@ -415,8 +460,9 @@ def main():
             sys.exit("error: refusing to overwrite %s" % final)
 
     # Two reversible phases: stage every rename under a unique name, then move
-    # each into place. Any failure rewinds whatever already happened, so an
-    # interrupted run cannot strand audio under a staging name.
+    # each into place. A raised exception rewinds whatever already happened.
+    # A SIGKILL, or a failure inside the rewind itself, can still leave staging
+    # files behind -- the next run refuses to start and names them.
     staged = []
     try:
         for i, (_, path, _, newname) in enumerate(plan):
