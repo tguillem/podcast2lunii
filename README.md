@@ -58,7 +58,7 @@ and `.pi` backup handling, but neither replaces a device backup.
 python3 -m unittest discover -s tests -v
 python3 -m compileall -q lunii-pack/scripts tools tests
 python3 -m py_compile podcast-renumber
-sh -n yt-dlp-podcast lunii-pack/podcast2lunii lunii-pack/install_pack
+for f in yt-dlp-podcast lunii-pack/podcast2lunii lunii-pack/install_pack; do sh -n "$f" || exit 1; done
 python3 tools/check_deps.py
 ```
 

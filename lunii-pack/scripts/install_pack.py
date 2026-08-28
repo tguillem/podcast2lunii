@@ -346,7 +346,10 @@ def build_fs_pack(pack: ArchivePack, work_root: Path = WORK_ROOT) -> FsBuildSumm
     if bool(story.get("nightModeAvailable")):
         (out_dir / "nm").touch()
 
-    stages: list[dict[str, Any]] = story["stageNodes"]
+    stages: list[dict[str, Any]] = list(story["stageNodes"])
+    # The device boots the first stage, so squareOne must lead regardless of
+    # the order the archive happened to store.
+    stages.sort(key=lambda stage: not bool(stage.get("squareOne")))
     actions: list[dict[str, Any]] = story["actionNodes"]
     stage_index: dict[str, int] = {}
     for i, stage in enumerate(stages):

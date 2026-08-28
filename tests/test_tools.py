@@ -178,53 +178,68 @@ class NeverDeletesTests(unittest.TestCase):
         survivors = list(self.audio.rglob("*.mp3"))
         self.assertEqual(len(survivors), len(titles))
 
-    def test_interrupted_rename_preserves_audio(self):
-        """Fault-inject after every rename; both streams must survive.
-
-        Regression: rollback recorded each move after making it, so an
-        interrupt in that gap let cleanup rename one file over another.
-        """
-        import mutagen
+    def _swap_fixture(self, target):
+        """Two files whose plan swaps their prefixes, with distinct audio."""
         from mutagen.easyid3 import EasyID3
         from mutagen.id3 import ID3NoHeaderError
-
-        def build(target):
-            target.mkdir(parents=True)
-            for name, title, secs in (("01_same.mp3", "Beta", "0.2"),
-                                      ("02_same.mp3", "Alpha", "0.4")):
-                subprocess.run(
-                    ["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
-                     "-i", "anullsrc=r=44100:cl=mono", "-t", secs, "-q:a", "9",
-                     str(target / name)], check=True)
-                try:
-                    tag = EasyID3(target / name)
-                except ID3NoHeaderError:
-                    tag = EasyID3()
-                    tag.save(target / name)
-                    tag = EasyID3(target / name)
-                tag["title"] = title
-                tag.save()
-
-        def durations(folder):
-            out = []
-            for path in sorted(folder.rglob("*")):
-                if path.is_file():
-                    audio = mutagen.File(path)
-                    out.append("%.2f" % audio.info.length if audio else "other")
-            return sorted(out)
-
-        feed = self.dir / "swap.xml"
+        target.mkdir(parents=True)
+        for name, title, secs in (("01_same.mp3", "Beta", "0.2"),
+                                  ("02_same.mp3", "Alpha", "0.4")):
+            subprocess.run(
+                ["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                 "-i", "anullsrc=r=44100:cl=mono", "-t", secs, "-q:a", "9",
+                 str(target / name)], check=True)
+            try:
+                tag = EasyID3(target / name)
+            except ID3NoHeaderError:
+                tag = EasyID3()
+                tag.save(target / name)
+                tag = EasyID3(target / name)
+            tag["title"] = title
+            tag.save()
+        feed = target.parent / ("swap-%s.xml" % target.name)
         feed.write_text(
             '<?xml version="1.0"?><rss version="2.0"><channel><title>S</title>'
             "<item><title>Beta</title><guid>b</guid></item>"
             "<item><title>Alpha</title><guid>a</guid></item></channel></rss>")
+        return feed
 
+    @staticmethod
+    def _durations(folder):
+        import mutagen
+        out = []
+        for path in sorted(folder.rglob("*")):
+            if path.is_file():
+                audio = mutagen.File(path)
+                out.append("%.2f" % audio.info.length if audio else "other:" + path.name)
+        return sorted(out)
+
+    def test_clean_run_actually_swaps_the_two_files(self):
+        """Control: without this, the interrupt test passes with no renaming."""
+        folder = self.audio
+        feed = self._swap_fixture(folder)
+        run_renumber(feed, folder)
+        import mutagen
+        self.assertEqual(
+            {p.name: "%.2f" % mutagen.File(p).info.length
+             for p in folder.iterdir() if p.suffix == ".mp3"},
+            {"01_same.mp3": "0.44", "02_same.mp3": "0.24"},
+            "the plan must actually swap the two prefixes",
+        )
+
+    def test_interrupted_rename_preserves_audio(self):
+        """Fault-inject after every rename; no audio may be lost.
+
+        Regression: rollback recorded each move after making it, so an
+        interrupt in that gap let cleanup rename one file over another.
+        """
         reference = None
+        fired_at_least_once = False
         for stop_after in range(1, 6):
             folder = self.dir / ("fi%d" % stop_after)
-            build(folder)
+            feed = self._swap_fixture(folder)
             if reference is None:
-                reference = durations(folder)
+                reference = self._durations(folder)
             real, seen = Path.rename, {"n": 0}
 
             def boom(self, target, _real=real, _seen=seen, _k=stop_after):
@@ -241,8 +256,65 @@ class NeverDeletesTests(unittest.TestCase):
                 pass
             finally:
                 Path.rename = real
-            self.assertEqual(durations(folder), reference,
+
+            if seen["n"] >= stop_after:
+                fired_at_least_once = True
+            self.assertEqual(self._durations(folder), reference,
                              "audio lost when interrupted after rename #%d" % stop_after)
+            self.assertEqual(
+                [p.name for p in folder.glob(".renum.*")], [],
+                "staging file stranded after interrupt #%d" % stop_after)
+        self.assertTrue(fired_at_least_once,
+                        "the fault injector never fired: the test proves nothing")
+
+    def test_three_way_rename_cycle_rewinds_completely(self):
+        """An interlocking cycle needs more than one rewind pass."""
+        import mutagen
+        from mutagen.easyid3 import EasyID3
+        from mutagen.id3 import ID3NoHeaderError
+        folder = self.dir / "cycle"
+        folder.mkdir(parents=True)
+        order = [("01_x.mp3", "C", "0.2"), ("02_x.mp3", "A", "0.4"), ("03_x.mp3", "B", "0.6")]
+        for name, title, secs in order:
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                            "-i", "anullsrc=r=44100:cl=mono", "-t", secs,
+                            "-q:a", "9", str(folder / name)], check=True)
+            try:
+                tag = EasyID3(folder / name)
+            except ID3NoHeaderError:
+                tag = EasyID3(); tag.save(folder / name); tag = EasyID3(folder / name)
+            tag["title"] = title
+            tag.save()
+        feed = self.dir / "cycle.xml"
+        feed.write_text(
+            '<?xml version="1.0"?><rss version="2.0"><channel><title>S</title>'
+            "<item><title>C</title><guid>c</guid></item>"
+            "<item><title>B</title><guid>b</guid></item>"
+            "<item><title>A</title><guid>a</guid></item></channel></rss>")
+        reference = self._durations(folder)
+        for stop_after in range(1, 7):
+            work = self.dir / ("cyc%d" % stop_after)
+            shutil.copytree(folder, work)
+            real, seen = Path.rename, {"n": 0}
+
+            def boom(self, target, _real=real, _seen=seen, _k=stop_after):
+                _seen["n"] += 1
+                result = _real(self, target)
+                if _seen["n"] == _k:
+                    raise KeyboardInterrupt
+                return result
+
+            Path.rename = boom
+            try:
+                run_renumber(feed, work)
+            except BaseException:
+                pass
+            finally:
+                Path.rename = real
+            self.assertEqual(self._durations(work), reference,
+                             "audio lost in a 3-cycle at rename #%d" % stop_after)
+            self.assertEqual([p.name for p in work.glob(".renum.*")], [],
+                             "staging file stranded in a 3-cycle at #%d" % stop_after)
 
 
 class ImageTests(unittest.TestCase):
@@ -286,11 +358,213 @@ class PackIndexTests(unittest.TestCase):
     def test_archive_rejects_path_traversal(self):
         with tempfile.TemporaryDirectory() as tmp:
             bad = Path(tmp) / "bad.zip"
+            stage_uuid = str(uuid.uuid4())
+            story = {
+                "format": "v1", "version": 2, "uuid": str(uuid.uuid4()),
+                "stageNodes": [{
+                    "uuid": stage_uuid, "id": stage_uuid, "name": "cover",
+                    "squareOne": True, "image": None, "audio": None,
+                    "okTransition": None, "homeTransition": None,
+                    "controlSettings": {"wheel": 0, "ok": 1, "home": 0,
+                                        "pause": 0, "autoplay": 0},
+                }],
+                "actionNodes": [],
+            }
+            # Sanity: this story is otherwise valid, so the traversal member is
+            # the only reason read_archive may reject the archive.
+            good = Path(tmp) / "good.zip"
+            with zipfile.ZipFile(good, "w") as zf:
+                zf.writestr("story.json", json.dumps(story))
+            install_pack.read_archive(good)
+
             with zipfile.ZipFile(bad, "w") as zf:
-                zf.writestr("story.json", json.dumps({"uuid": str(uuid.uuid4())}))
+                zf.writestr("story.json", json.dumps(story))
                 zf.writestr("assets/../escape.mp3", b"x")
             with self.assertRaises(install_pack.PackError):
                 install_pack.read_archive(bad)
+
+            # A traversal member outside assets/ is never extracted, so this
+            # pins the generic name guard rather than the asset-name one.
+            for member in ("../escape.mp3", "a/../../escape.mp3", "/abs.mp3"):
+                with self.subTest(member=member):
+                    hostile = Path(tmp) / ("h%d.zip" % abs(hash(member)))
+                    with zipfile.ZipFile(hostile, "w") as zf:
+                        zf.writestr("story.json", json.dumps(story))
+                        zf.writestr(member, b"x")
+                    with self.assertRaises(install_pack.PackError):
+                        install_pack.read_archive(hostile)
+
+
+class ClassifierTests(unittest.TestCase):
+    """Pin is_part_series directly.
+
+    An earlier suite exercised it only through end-to-end fixtures, so
+    replacing its whole body with `return True` still passed.
+    """
+
+    @staticmethod
+    def items(pairs):
+        import datetime
+        out = []
+        for title, pub in pairs:
+            out.append({
+                "norm": renumber.norm(title),
+                "pub": datetime.datetime(2025, pub[0], pub[1]) if pub else None,
+            })
+        return out
+
+    def classify(self, pairs):
+        items = self.items(pairs)
+        dominant, marks = renumber.series_marks(items)
+        if dominant is None:
+            return False
+        return renumber.is_part_series(items, marks, dominant)
+
+    def test_rejects_dates_in_any_wording(self):
+        for shape in ("Bulletin du %s", "Bulletin %s",
+                      "Les Matins - %s/2025", "Journal du soir, le %s"):
+            with self.subTest(shape=shape):
+                self.assertFalse(self.classify([
+                    (shape % "02/03", (3, 2)),
+                    (shape % "01/03", (3, 1)),
+                    (shape % "28/02", (2, 28)),
+                ]), "a date must never be read as a part number")
+
+    def test_rejects_a_month_window_whose_days_look_like_parts(self):
+        pairs = [("Journal - %02d/12" % d, (12, d)) for d in range(12, 0, -1)]
+        pairs += [("Journal - %02d/11" % d, (11, d)) for d in range(30, 24, -1)]
+        self.assertFalse(self.classify(pairs))
+
+    def test_accepts_a_real_series(self):
+        self.assertTrue(self.classify(
+            [("Histoire %d/3 : x" % k, (4, 6)) for k in (1, 2, 3)]))
+
+    def test_accepts_a_partial_window(self):
+        self.assertTrue(self.classify(
+            [("Serie %d/10" % k, (4, 6)) for k in range(1, 6)]))
+
+    def test_accepts_a_series_with_a_missing_part(self):
+        self.assertTrue(self.classify(
+            [("S %d/8" % k, (4, 6)) for k in (1, 2, 4, 5)]))
+
+    def test_prefers_the_part_token_over_a_date_in_the_subtitle(self):
+        pairs = [("Od 1/4 : un", (4, 6)), ("Od 2/4 : deux", (4, 6)),
+                 ("Od 3/4 : le carnet du 04/03", (4, 6)), ("Od 4/4 : fin", (4, 6))]
+        items = self.items(pairs)
+        dominant, marks = renumber.series_marks(items)
+        self.assertEqual(dominant, "4")
+        self.assertEqual([m.group(1) for m in marks], ["1", "2", "3", "4"])
+        self.assertTrue(renumber.is_part_series(items, marks, dominant))
+
+    def test_rejects_when_the_leftovers_carry_their_own_numbering(self):
+        """A real story's extras are a "Bonus"; a date feed's are other months."""
+        self.assertFalse(self.classify(
+            [("A %d/3" % k, (4, 6)) for k in (1, 2, 3)] +
+            [("B %d/5" % k, (4, 6)) for k in (1, 2)]))
+
+
+@unittest.skipUnless(HAVE_FFMPEG, "ffmpeg is required to synthesize test audio")
+class FallbackOrderTests(unittest.TestCase):
+    def test_unnumbered_feed_plays_oldest_first(self):
+        """Pins the direction of the no-series fallback, not just the set."""
+        directory = Path(tempfile.mkdtemp(prefix="fallback-"))
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        audio = directory / "audio"
+        titles = ["Newest", "Middle", "Oldest"]     # feeds list newest first
+        write_audio(audio, titles)
+        run_renumber(write_feed(directory, titles), audio)
+        self.assertEqual(
+            [p.name for p in sorted(audio.iterdir()) if p.suffix == ".mp3"],
+            ["01_Oldest.mp3", "02_Middle.mp3", "03_Newest.mp3"])
+
+
+@unittest.skipUnless(HAVE_FFMPEG, "ffmpeg is required to synthesize test audio")
+class SquareOneTests(unittest.TestCase):
+    def test_square_one_stage_is_serialized_first(self):
+        """The device boots the first stage, whatever order the archive used."""
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            mp3 = work / "a.mp3"
+            subprocess.run(
+                ["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                 "-i", "anullsrc=r=44100:cl=mono", "-t", "0.2",
+                 "-b:a", "64k", "-codec:a", "libmp3lame",
+                 "-id3v2_version", "0", "-write_id3v1", "0", str(mp3)],
+                check=True)
+            audio = mp3.read_bytes()
+
+            from PIL import Image
+            bmp = lunii_image.build_bmp(Image.new("RGB", (320, 240), (9, 9, 9)), rle=True)
+
+            def stage(name, square, image=None):
+                key = str(uuid.uuid5(uuid.NAMESPACE_DNS, name))
+                return {"uuid": key, "id": key, "name": name, "squareOne": square,
+                        "image": image, "audio": "a.mp3", "okTransition": None,
+                        "homeTransition": None,
+                        "controlSettings": {"wheel": 0, "ok": 1, "home": 0,
+                                            "pause": 0, "autoplay": 0}}
+
+            # squareOne deliberately stored second.
+            story = {"format": "v1", "version": 2, "uuid": str(uuid.uuid4()),
+                     "stageNodes": [stage("menu", False),
+                                    stage("cover", True, "c.bmp")],
+                     "actionNodes": []}
+            pack = install_pack.ArchivePack(
+                story=story, assets={"a.mp3": audio, "c.bmp": bmp})
+            summary = install_pack.build_fs_pack(pack, work_root=work / "out")
+            self.assertEqual(summary.stage_count, 2)
+            # ni is a 512-byte header then one 44-byte record per stage, in
+            # serialization order. Only the cover carries an image, so the
+            # first record's image index says which stage leads.
+            ni = (summary.work_dir / "ni").read_bytes()
+            first_image_index = struct.unpack_from("<i", ni, 512)[0]
+            self.assertEqual(first_image_index, 0,
+                             "squareOne (the only stage with an image) must lead")
+
+
+class RssOnlyOrderTests(unittest.TestCase):
+    def test_url_mode_fetches_only_the_rss_feed(self):
+        """A channel or item link must not trigger a second HTTP request."""
+        feed_url = "https://feeds.example/show.xml"
+        data = (
+            '<?xml version="1.0"?><rss version="2.0"><channel>'
+            "<title>Synthetic show</title>"
+            "<link>https://site.example/show</link>"
+            "<item><title>Newest</title><link>https://site.example/e3</link></item>"
+            "<item><title>Middle</title><link>https://site.example/e2</link></item>"
+            "<item><title>Oldest</title><link>https://site.example/e1</link></item>"
+            "</channel></rss>"
+        ).encode()
+        calls = []
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, limit):
+                return data[:limit]
+
+        def open_feed(request, timeout):
+            calls.append(request.full_url)
+            if request.full_url != feed_url:
+                raise AssertionError("unexpected secondary fetch: %s" % request.full_url)
+            return Response()
+
+        real = renumber.urlopen
+        renumber.urlopen = open_feed
+        try:
+            _, items = renumber.load_feed(feed_url)
+        finally:
+            renumber.urlopen = real
+
+        self.assertEqual(calls, [feed_url])
+        self.assertEqual(
+            [item["title"] for item in sorted(items, key=lambda item: item["seq"])],
+            ["Oldest", "Middle", "Newest"],
+        )
 
 
 if __name__ == "__main__":

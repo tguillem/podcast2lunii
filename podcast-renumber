@@ -49,7 +49,6 @@ from mutagen.mp4 import MP4
 AUDIO_EXTS = {".mp3", ".m4a", ".m4b", ".ogg", ".oga", ".opus", ".flac"}
 PREFIX_RE = re.compile(r"^\d+_")
 EPNUM_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
-DATE_LIKE_RE = re.compile(r"\bdu\s+\d{1,2}\s*/\s*\d{1,2}")
 MAX_FEED_BYTES = 16 * 1024 * 1024
 EXCLUDED_DIRNAME = ".excluded"
 STAGING_GLOB = ".renum.*.tmp"
@@ -106,22 +105,17 @@ def load_feed(src):
     #      with un-numbered extras (e.g. a "Bonus") kept after, oldest first.
     #   2. else the RSS list reversed (newest-first feed -> oldest first).
     ranks = None
-    marks = [None if DATE_LIKE_RE.search(it["norm"])
-             else EPNUM_RE.search(it["norm"]) for it in items]
-    series_ms = [m.group(2) for m in marks if m]
-    dom_m = max(set(series_ms), key=series_ms.count) if series_ms else None
-    if dom_m is not None and series_ms.count(dom_m) * 2 > len(items):
-        numbered = sorted(
-            (i for i, m in enumerate(marks) if m and m.group(2) == dom_m),
-            key=lambda i: int(marks[i].group(1)))
-        if not is_part_series(marks, numbered, int(dom_m)):
-            numbered = []
+    dominant, marks = series_marks(items)
+    if (dominant is not None
+            and sum(m is not None for m in marks) * 2 > len(items)
+            and is_part_series(items, marks, dominant)):
+        numbered = sorted((i for i, m in enumerate(marks) if m),
+                          key=lambda i: int(marks[i].group(1)))
         num_set = set(numbered)
-        if numbered:
-            rest = [i for i in range(len(items) - 1, -1, -1) if i not in num_set]
-            for i in rest:
-                items[i]["extra"] = True   # un-numbered item in a numbered story
-            ranks = numbered + rest    # extras last, and only with --no-drop-trailers
+        rest = [i for i in range(len(items) - 1, -1, -1) if i not in num_set]
+        for i in rest:
+            items[i]["extra"] = True       # un-numbered item in a numbered story
+        ranks = numbered + rest            # extras last, only with --no-drop-trailers
 
     if ranks is None:
         ranks = range(len(items) - 1, -1, -1)
@@ -131,25 +125,55 @@ def load_feed(src):
     return (channel.findtext("title") or "").strip(), items
 
 
-def is_part_series(marks, numbered, total_parts):
-    """True when the 'N/M' matches really are parts 1..M of one story.
+def series_marks(items):
+    """Pick the 'N/M' token in each title that looks like a part marker.
 
-    Without this, a date is read as a part number: "Bulletin du 04/03"
-    yields N=4, M=3, so a feed whose window straddles a month boundary looks
-    like a 3-part series and the minority month becomes un-numbered 'extras'.
-    A real series numbers its parts 1..M, each exactly once.
+    A title can carry two ("Serie 3/4 : le carnet du 04/03"), so prefer the
+    token whose denominator the rest of the feed agrees on.
     """
+    tokens = [list(EPNUM_RE.finditer(it["norm"])) for it in items]
+    counts = {}
+    for row in tokens:
+        for match in row:
+            counts[match.group(2)] = counts.get(match.group(2), 0) + 1
+    if not counts:
+        return None, []
+    dominant = max(counts, key=lambda key: (counts[key], -int(key)))
+    marks = [next((m for m in row if m.group(2) == dominant), None) for row in tokens]
+    return dominant, marks
+
+
+def looks_like_dates(items, marks):
+    """True when every checkable 'N/M' is just that item's publication date."""
+    checkable = [(items[i], m) for i, m in enumerate(marks) if m and items[i].get("pub")]
+    if not checkable:
+        return False
+    return all(int(m.group(1)) == it["pub"].day
+               and int(m.group(2)) == it["pub"].month for it, m in checkable)
+
+
+def is_part_series(items, marks, dominant):
+    """True when the marked items really are parts 1..M of one story.
+
+    Two independent signals keep dates out, because a date parses as a part
+    number: "Bulletin du 04/03" is N=4, M=3. Requiring every part instead
+    would reject the common case, since a feed usually exposes only a window
+    of a long series.
+    """
+    total_parts = int(dominant)
     if total_parts < 2:
         return False
-    ns = [int(marks[i].group(1)) for i in numbered]
-    if len(set(ns)) != len(ns):            # a part number repeats
+    ns = [int(m.group(1)) for m in marks if m]
+    if len(ns) < 2 or len(set(ns)) != len(ns):
         return False
     if any(n < 1 or n > total_parts for n in ns):
-        return False                       # a part number outside 1..M
-    ordered = sorted(ns)
-    # A feed usually exposes only a window of a long series, so do not demand
-    # every part -- but the parts that are present must be consecutive.
-    return ordered == list(range(ordered[0], ordered[0] + len(ordered)))
+        return False
+    if looks_like_dates(items, marks):
+        return False
+    # A real story's leftovers are things like a "Bonus", carrying no N/M at
+    # all. A misread date feed's leftovers are simply other months.
+    return not any(m is None and EPNUM_RE.search(items[i]["norm"])
+                   for i, m in enumerate(marks))
 
 
 def title_candidates(path, tags):
@@ -410,12 +434,20 @@ def main():
         # rather than from a log of what succeeded: an interrupt can land
         # between a rename and any bookkeeping, so only on-disk state is
         # trustworthy, and a stale log can rename one file over another.
-        for staging, origin, final in reversed(staged):
-            if final.exists() and not staging.exists() and not origin.exists():
-                final.rename(origin)
-        for staging, origin, final in reversed(staged):
-            if staging.exists() and not origin.exists():
-                staging.rename(origin)
+        # Repeat to a fixpoint: with an interlocking cycle of renames, one
+        # pass frees a name that lets the next entry move, so a single pass
+        # stops halfway and leaves a file under another file's name.
+        while True:
+            moved = False
+            for staging, origin, final in reversed(staged):
+                if final.exists() and not staging.exists() and not origin.exists():
+                    final.rename(origin)
+                    moved = True
+                elif staging.exists() and not origin.exists():
+                    staging.rename(origin)
+                    moved = True
+            if not moved:
+                break
         raise
 
     print("done: %d files tagged, %d renamed, %d moved to %s/"
