@@ -55,11 +55,16 @@ and `.pi` backup handling, but neither replaces a device backup.
 ## Development checks
 
 ```sh
-python3 -m compileall -q lunii-pack/scripts tools
+python3 -m unittest discover -s tests -v
+python3 -m compileall -q lunii-pack/scripts tools tests
 python3 -m py_compile podcast-renumber
 sh -n yt-dlp-podcast lunii-pack/podcast2lunii lunii-pack/install_pack
 python3 tools/check_deps.py
 ```
+
+The tests need `ffmpeg` but no network, no voice model, and no device. They
+cover episode ordering, the guarantee that no audio is ever deleted, recovery
+from an interrupted rename, BMP output, and archive validation.
 
 ## License
 

@@ -598,6 +598,7 @@ def write_pack_index_atomic(pi: Path, entries: list[uuid.UUID]) -> Path:
     backup = unique_pi_backup(pi)
 
     tmp: Path | None = None
+    replaced = False
     try:
         with tempfile.NamedTemporaryFile(
             mode="wb",
@@ -611,7 +612,10 @@ def write_pack_index_atomic(pi: Path, entries: list[uuid.UUID]) -> Path:
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, pi)
+        replaced = True
     except BaseException as original:
+        if not replaced:
+            raise
         try:
             replace_from_copy(backup, pi)
         except BaseException as recovery:
@@ -721,6 +725,8 @@ def specific_key_v2_from_uuid(uuid_block: bytes) -> bytes:
 
 def add_boot_file_v2(pack_dir: Path, uuid_block: bytes) -> None:
     ri = (pack_dir / "ri").read_bytes()[:64]
+    if not ri:
+        fail("pack has no images, so its boot file would be empty")
     key = specific_key_v2_from_uuid(uuid_block)
     (pack_dir / "bt").write_bytes(cipher_first_block_specific_key_v2(ri, key))
 
@@ -800,6 +806,7 @@ def install(summary: FsBuildSummary, mount: Path, device: DeviceInfo, entries: l
             tmp.rename(target)
             installed_new_target = True
             new_entries, _ = plan_index(entries, summary.pack_uuid, replace)
+            os.sync()   # flush the pack payload before the index points at it
             backup = write_pack_index_atomic(mount / ".pi", new_entries)
             committed = True
         except BaseException as original:
@@ -857,7 +864,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         description="Install a generated STUdio/Lunii archive directly onto a mounted Lunii device."
     )
     parser.add_argument("pack_zip", type=Path, help="generated STUdio archive zip")
-    parser.add_argument("--mount", type=Path, required=True, help="mounted Lunii device root, e.g. /media/tom/LUNII")
+    parser.add_argument("--mount", type=Path, required=True, help="mounted Lunii device root "
+                             "(Linux: /media/<user>/LUNII, macOS: /Volumes/LUNII)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="validate and print actions without writing device content")
     mode.add_argument("--yes", action="store_true", help="perform the install")

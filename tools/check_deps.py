@@ -257,6 +257,16 @@ def package_results(python: Path | None) -> tuple[list[Result], dict[str, str]]:
     pins, error = requirements()
     if error:
         return [Result("python_packages", "MISSING", f"cannot read exact pins: {error}")], {}
+    unmapped = sorted(set(pins) - set(PACKAGE_IMPORTS))
+    if unmapped:
+        # Without this, a newly pinned dependency is reported as "not installed",
+        # which is untrue and sends the reader chasing the wrong problem.
+        return [Result(
+            "python_packages",
+            "MISSING",
+            "requirements.txt pins %s, which this script has no import name for; "
+            "add it to PACKAGE_IMPORTS in tools/check_deps.py" % ", ".join(unmapped),
+        )], {}
     if python is None:
         return (
             [

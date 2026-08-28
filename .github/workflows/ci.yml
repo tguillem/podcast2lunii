@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: 2026 Thomas Guillem
+# SPDX-License-Identifier: MPL-2.0
+name: checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install test dependencies
+        # Not the full requirements.txt: piper-tts pulls onnxruntime, and no
+        # test needs speech synthesis.
+        run: pip install defusedxml==0.7.1 mutagen==1.48.1 Pillow==12.3.0
+      - name: Syntax checks
+        run: |
+          python3 -m compileall -q lunii-pack/scripts tools tests
+          python3 -m py_compile podcast-renumber
+          sh -n yt-dlp-podcast lunii-pack/podcast2lunii lunii-pack/install_pack
+      - name: Tests
+        run: python3 -m unittest discover -s tests -v

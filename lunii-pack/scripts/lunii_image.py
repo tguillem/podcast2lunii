@@ -70,10 +70,15 @@ def add_number_badge(img, number, corner="br"):
     # solid disc with contrasting ring
     draw.ellipse([x0 - 4, y0 - 4, x1 + 4, y1 + 4], fill=(255, 255, 255))
     draw.ellipse([x0, y0, x1, y1], fill=(210, 40, 40))
-    font = _load_font(64)
+    # Shrink to fit: at a fixed 64px a 3-digit number overflows the 92px disc
+    # and runs off the 320px canvas.
     s = str(number)
-    bb = draw.textbbox((0, 0), s, font=font)
-    tw, th = bb[2] - bb[0], bb[3] - bb[1]
+    for size in range(64, 11, -4):
+        font = _load_font(size)
+        bb = draw.textbbox((0, 0), s, font=font)
+        tw, th = bb[2] - bb[0], bb[3] - bb[1]
+        if tw <= d - 12 and th <= d - 12:
+            break
     draw.text((x0 + (d - tw) / 2 - bb[0], y0 + (d - th) / 2 - bb[1]),
               s, font=font, fill=(255, 255, 255))
     return img
