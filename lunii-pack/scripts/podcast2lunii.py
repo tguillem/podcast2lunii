@@ -139,12 +139,14 @@ def download_feed(url, download_dir, extra):
     """
     download_dir = Path(download_dir).expanduser()
     download_dir.mkdir(parents=True, exist_ok=True)
-    name = subprocess.run(
+    output = subprocess.run(
         [str(YTDLP), "--flat-playlist", "-I1", "--print",
          "%(playlist_title)S", "--output-na-placeholder", "", url],
-        capture_output=True, text=True, check=True).stdout.splitlines()
-    name = (name[0].strip() if name else "")
-    if not name:
+        capture_output=True, text=True, check=True).stdout
+    # Match the shell wrapper's `head -n1`: split only on the output LF, not on
+    # Unicode separators that are valid filename characters, and keep spaces.
+    name = output.partition("\n")[0]
+    if not name.strip():
         sys.exit("could not read playlist title from %s" % url)
     download_root = download_dir.resolve()
     folder = (download_root / name).resolve()

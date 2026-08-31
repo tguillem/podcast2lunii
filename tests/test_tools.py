@@ -778,6 +778,32 @@ class RobustnessTests(unittest.TestCase):
         self.assertEqual(downloaded, [],
                          "must fail on the missing voice before downloading")
 
+    def test_download_folder_preserves_title_whitespace(self):
+        """The wrapper must look up the exact directory created by yt-dlp."""
+        import types
+        p2l = load(SCRIPTS / "podcast2lunii.py", "p2l_folder_test")
+        title = " Synthetic\u2028album "
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append((args, kwargs))
+            if "--flat-playlist" in args:
+                return types.SimpleNamespace(stdout=title + "\n")
+            (Path(kwargs["cwd"]) / title).mkdir()
+            return types.SimpleNamespace(returncode=0)
+
+        real_run = p2l.subprocess.run
+        p2l.subprocess.run = run
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    folder = p2l.download_feed(
+                        "https://example.invalid/feed", Path(tmp), [])
+                self.assertEqual(folder, (Path(tmp) / title).resolve())
+                self.assertEqual(len(calls), 2)
+        finally:
+            p2l.subprocess.run = real_run
+
     @unittest.skipUnless(HAVE_FFMPEG, "ffmpeg is required to synthesize test audio")
     def test_empty_title_yields_silence_not_a_crash(self):
         """clean_title can reduce a title to nothing; piper exits 1 on empty."""
