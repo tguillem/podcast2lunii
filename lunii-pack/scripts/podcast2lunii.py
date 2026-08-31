@@ -31,6 +31,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import unicodedata
 import uuid
 import warnings
@@ -58,6 +59,8 @@ PREFIX_RE = re.compile(r"^\d+_")
 AUDIO_LEAD_IN_MS = 500
 MAX_FEED_BYTES = 16 * 1024 * 1024
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
+COVER_FETCH_ATTEMPTS = 3
+COVER_RETRY_DELAY_SECONDS = 1
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 
 
@@ -95,6 +98,31 @@ def fetch_bytes(url, *, limit, params=None):
                     "response from %s exceeds %d bytes" % (response.url, limit)
                 )
         return bytes(data)
+
+
+def fetch_cover_bytes(url, *, limit, params=None):
+    """Fetch RSS artwork data, retrying only transient request failures."""
+    for attempt in range(1, COVER_FETCH_ATTEMPTS + 1):
+        try:
+            return fetch_bytes(url, limit=limit, params=params)
+        except requests.RequestException as exc:
+            response = getattr(exc, "response", None)
+            status = getattr(response, "status_code", None)
+            retryable = status is None or status in (408, 429) or status >= 500
+            if not retryable or attempt == COVER_FETCH_ATTEMPTS:
+                raise
+            print(
+                "  cover: request failed (%s); retrying in %d second "
+                "(attempt %d/%d)"
+                % (
+                    exc,
+                    COVER_RETRY_DELAY_SECONDS,
+                    attempt + 1,
+                    COVER_FETCH_ATTEMPTS,
+                ),
+                file=sys.stderr,
+            )
+            time.sleep(COVER_RETRY_DELAY_SECONDS)
 
 
 def decode_image(data, source):
@@ -234,7 +262,7 @@ def silent_mp3(out, ms=AUDIO_LEAD_IN_MS):
 def rss_cover_url(feed_url):
     """Best-effort artwork URL from an RSS feed."""
     try:
-        root = ET.fromstring(fetch_bytes(feed_url, limit=MAX_FEED_BYTES))
+        root = ET.fromstring(fetch_cover_bytes(feed_url, limit=MAX_FEED_BYTES))
     except (
         requests.RequestException,
         ET.ParseError,
@@ -295,7 +323,7 @@ def resolve_cover(args, title, dest):
         )
 
     try:
-        data = fetch_bytes(url, limit=MAX_IMAGE_BYTES)
+        data = fetch_cover_bytes(url, limit=MAX_IMAGE_BYTES)
         img = decode_image(data, url)
     except (requests.RequestException, ValueError) as e:
         sys.exit("Cover download failed for %s: %s" % (url, e))

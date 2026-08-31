@@ -778,6 +778,83 @@ class RobustnessTests(unittest.TestCase):
         self.assertEqual(downloaded, [],
                          "must fail on the missing voice before downloading")
 
+    def test_cover_fetch_retries_transient_server_errors(self):
+        p2l = load(SCRIPTS / "podcast2lunii.py", "p2l_cover_retry_test")
+        calls = []
+        sleeps = []
+
+        def fetch(*args, **kwargs):
+            calls.append((args, kwargs))
+            if len(calls) < 3:
+                response = type("Response", (), {"status_code": 500})()
+                raise p2l.requests.HTTPError("server error", response=response)
+            return b"cover"
+
+        real_fetch = p2l.fetch_bytes
+        real_sleep = p2l.time.sleep
+        p2l.fetch_bytes = fetch
+        p2l.time.sleep = sleeps.append
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                data = p2l.fetch_cover_bytes(
+                    "https://example.invalid/cover", limit=1024)
+        finally:
+            p2l.fetch_bytes = real_fetch
+            p2l.time.sleep = real_sleep
+
+        self.assertEqual(data, b"cover")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleeps, [1, 1])
+
+    def test_cover_fetch_does_not_retry_permanent_http_error(self):
+        p2l = load(SCRIPTS / "podcast2lunii.py", "p2l_cover_no_retry_test")
+        calls = []
+
+        def fetch(*args, **kwargs):
+            calls.append((args, kwargs))
+            response = type("Response", (), {"status_code": 404})()
+            raise p2l.requests.HTTPError("not found", response=response)
+
+        real_fetch = p2l.fetch_bytes
+        real_sleep = p2l.time.sleep
+        p2l.fetch_bytes = fetch
+        p2l.time.sleep = lambda delay: self.fail("permanent error was retried")
+        try:
+            with self.assertRaises(p2l.requests.HTTPError):
+                p2l.fetch_cover_bytes(
+                    "https://example.invalid/missing", limit=1024)
+        finally:
+            p2l.fetch_bytes = real_fetch
+            p2l.time.sleep = real_sleep
+
+        self.assertEqual(len(calls), 1)
+
+    def test_cover_fetch_stops_after_three_server_errors(self):
+        p2l = load(SCRIPTS / "podcast2lunii.py", "p2l_cover_retry_limit_test")
+        calls = []
+        sleeps = []
+
+        def fetch(*args, **kwargs):
+            calls.append((args, kwargs))
+            response = type("Response", (), {"status_code": 500})()
+            raise p2l.requests.HTTPError("server error", response=response)
+
+        real_fetch = p2l.fetch_bytes
+        real_sleep = p2l.time.sleep
+        p2l.fetch_bytes = fetch
+        p2l.time.sleep = sleeps.append
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(p2l.requests.HTTPError):
+                    p2l.fetch_cover_bytes(
+                        "https://example.invalid/cover", limit=1024)
+        finally:
+            p2l.fetch_bytes = real_fetch
+            p2l.time.sleep = real_sleep
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleeps, [1, 1])
+
     def test_download_folder_preserves_title_whitespace(self):
         """The wrapper must look up the exact directory created by yt-dlp."""
         import types
