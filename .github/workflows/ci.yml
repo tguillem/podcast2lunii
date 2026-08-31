@@ -20,7 +20,7 @@ jobs:
       - name: Install test dependencies
         # Not the full requirements.txt: piper-tts pulls onnxruntime, and no
         # test needs speech synthesis.
-        run: pip install defusedxml==0.7.1 mutagen==1.48.1 Pillow==12.3.0
+        run: pip install defusedxml==0.7.1 mutagen==1.48.1 Pillow==12.3.0 requests==2.34.2
       - name: Syntax checks
         run: |
           python3 -m compileall -q lunii-pack/scripts tools tests
