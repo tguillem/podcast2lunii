@@ -567,6 +567,71 @@ class RssOnlyOrderTests(unittest.TestCase):
         )
 
 
+class ExplicitEpisodeOrderTests(unittest.TestCase):
+    """An explicit Episode 1, 2, ... sequence can beat publication chronology.
+
+    The synthetic RSS order includes an unnumbered introduction that must stay
+    before Episode 1 when the numbered sequence establishes the RSS direction.
+    """
+
+    TITLES = [
+        "Series introduction",
+        "Episode 1. Alpha",
+        "Episode 2. Bravo",
+        "Episode 3. Charlie",
+        "Episode 4. Delta",
+        "Episode 5. Echo",
+        "Episode 6. Foxtrot",
+        "Episode 7. Golf",
+        "Episode 8 : Hotel",
+    ]
+
+    def order(self, titles):
+        directory = Path(tempfile.mkdtemp(prefix="episode-order-"))
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        items = "".join(
+            "<item><title>%s</title><guid>g%d</guid></item>"
+            % (title, i)
+            for i, title in enumerate(titles))
+        path = directory / "feed.xml"
+        path.write_text(
+            '<?xml version="1.0"?><rss version="2.0"><channel>'
+            "<title>Synthetic show</title>"
+            "%s</channel></rss>" % items)
+        _, parsed = renumber.load_feed(str(path))
+        return sorted(parsed, key=lambda item: item["seq"])
+
+    def test_forward_episode_sequence_preserves_the_rss_direction(self):
+        ordered = self.order(self.TITLES)
+        self.assertEqual([item["title"] for item in ordered], self.TITLES)
+        self.assertNotIn("extra", ordered[0],
+                         "the unnumbered introduction belongs in the pack")
+
+    def test_descending_episode_sequence_reverses_the_rss_direction(self):
+        titles = ["Épisode 3. End", "Épisode 2. Middle", "Épisode 1. Start",
+                  "Introduction"]
+        ordered = self.order(titles)
+        self.assertEqual([item["title"] for item in ordered], titles[::-1])
+
+    def test_a_numbered_minority_uses_the_reversed_rss_fallback(self):
+        titles = ["Episode 1. A", "Solo A", "Episode 2. B", "Solo B", "Solo C"]
+        ordered = self.order(titles)
+        self.assertEqual([item["title"] for item in ordered], titles[::-1])
+
+    def test_ambiguous_numbering_uses_the_reversed_rss_fallback(self):
+        cases = {
+            "exactly half": ["Episode 1", "Solo A", "Episode 2", "Solo B"],
+            "duplicate": ["Episode 1 A", "Episode 2", "Episode 1 B", "Solo"],
+            "episode zero": ["Episode 0", "Episode 1", "Episode 2", "Solo"],
+            "nonmonotonic": ["Episode 1", "Episode 3", "Episode 2", "Solo"],
+            "no separator": ["EpisodeNo1", "EpisodeNo2", "EpisodeNo3", "Solo"],
+        }
+        for name, titles in cases.items():
+            with self.subTest(name=name):
+                ordered = self.order(titles)
+                self.assertEqual([item["title"] for item in ordered], titles[::-1])
+
+
 class EmbeddedArcTests(unittest.TestCase):
     """A numbered arc inside an anthology must play in part order.
 

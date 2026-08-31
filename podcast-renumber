@@ -11,7 +11,10 @@ Episode order, highest priority first:
      ascending, so part 1 is first, with any un-numbered extras (e.g. a
      "Bonus") kept after. The title number wins even when publication order
      would play the story backwards.
-  2. Else the RSS item list reversed (feeds list newest first -> oldest first).
+  2. Else a coherent majority of titles beginning "Episode N". Its ascending
+     or descending numbers establish the RSS direction, while preserving an
+     unnumbered introduction in its relative place.
+  3. Else the RSS item list reversed (feeds list newest first -> oldest first).
 Each audio file is matched to a feed item by episode title, then gets:
 
   * items that are not part of the story moved aside into '.excluded/' by
@@ -49,6 +52,7 @@ from mutagen.mp4 import MP4
 AUDIO_EXTS = {".mp3", ".m4a", ".m4b", ".ogg", ".oga", ".opus", ".flac"}
 PREFIX_RE = re.compile(r"^\d+_")
 EPNUM_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
+EPISODE_RE = re.compile(r"^(?:episode|épisode)\s+(?:n(?:o|°)\s*)?(\d+)\b")
 MAX_FEED_BYTES = 16 * 1024 * 1024
 EXCLUDED_DIRNAME = ".excluded"
 STAGING_GLOB = ".renum.*.tmp"
@@ -82,8 +86,33 @@ def norm(s):
     return " ".join(s.casefold().split())
 
 
+def explicit_episode_ranks(items):
+    """Use a coherent ``Episode N`` majority to establish RSS direction.
+
+    Publication chronology can be the reverse of a story's explicit episode
+    sequence. Requiring a majority, distinct positive numbers, and a strictly
+    monotonic sequence keeps isolated uses of "episode 2" from overriding the
+    reversed-RSS fallback. The whole RSS list is oriented, rather than sorting
+    only marked items, so an unnumbered introduction keeps its intended place.
+    """
+    numbers = []
+    for item in items:
+        match = EPISODE_RE.search(item["norm"])
+        if match:
+            numbers.append(int(match.group(1)))
+    if len(numbers) < 2 or len(numbers) * 2 <= len(items):
+        return None
+    if any(number < 1 for number in numbers):
+        return None
+    if all(a < b for a, b in zip(numbers, numbers[1:])):
+        return range(len(items))
+    if all(a > b for a, b in zip(numbers, numbers[1:])):
+        return range(len(items) - 1, -1, -1)
+    return None
+
+
 def load_feed(src):
-    """Return (channel_title, items oldest-first: [{title, norm, pub, seq}])."""
+    """Return (channel_title, items in play order: [{title, norm, pub, seq}])."""
     if re.match(r"^https?://", src):
         req = Request(src, headers={"User-Agent": "podcast-renumber/1.0"})
         with urlopen(req, timeout=30) as response:
@@ -113,7 +142,8 @@ def load_feed(src):
     # Episode order, highest priority first:
     #   1. an 'N/M' series in the titles -> by N ascending (part 1 first),
     #      with un-numbered extras (e.g. a "Bonus") kept after, oldest first.
-    #   2. else the RSS list reversed (newest-first feed -> oldest first).
+    #   2. else a coherent "Episode N" majority establishes the RSS direction.
+    #   3. else the RSS list reversed (newest-first feed -> oldest first).
     ranks = None
     dominant, marks = series_marks(items)
     if (dominant is not None
@@ -126,6 +156,9 @@ def load_feed(src):
         for i in rest:
             items[i]["extra"] = True       # un-numbered item in a numbered story
         ranks = numbered + rest            # extras last, only with --no-drop-trailers
+
+    if ranks is None:
+        ranks = explicit_episode_ranks(items)
 
     if ranks is None:
         ranks = range(len(items) - 1, -1, -1)
